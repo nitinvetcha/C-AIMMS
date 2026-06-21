@@ -1,4 +1,8 @@
 """
+ISSUE identified: qwen is generating response at 1.25 tokens/second, main reason why data collection is running so slow (5 min/entry)
+"""
+
+"""
 qwen_client.py – Centralised Qwen3-4B Interface
 =================================================
 Single place to load, configure, and call the Qwen3-4B model.
