@@ -44,6 +44,9 @@ class StructureClassifier(nn.Module):
     def forward(self, x):
         return self.prediction_seq(x)
 
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
 class StructureDataset(Dataset):
     features_to_standardize: list = [0, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13]
     means: list = [0.0] * len(features_to_standardize)
@@ -53,7 +56,7 @@ class StructureDataset(Dataset):
         df = pd.read_csv(csvfilepath).astype(float)
 
         self.data = torch.tensor(df.iloc[:, 0:input_dim].values, dtype=torch.float32)
-        self.labels = torch.tensor(df.iloc[:, -1].values, dtype=torch.float32)
+        self.labels = torch.tensor(df.iloc[:, -1].values, dtype=torch.long)
 
         #Standardize the data
         for i in self.features_to_standardize:

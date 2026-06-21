@@ -1,17 +1,20 @@
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-import structure_classifier_class
+from structure_classifier_class import StructureClassifier, StructureDataset
 
 #hyperparameters
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 loss_function = nn.CrossEntropyLoss()
 num_epochs = 20
 batch_size = 32
 
 model = StructureClassifier().to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+training_losses = []
+validation_losses = []
 
 #returns the average loss over the training dataset for one epoch of training
 def train_model(training_dataloader):
@@ -24,7 +27,9 @@ def train_model(training_dataloader):
         loss.backward()
         optimizer.step()
         running_loss += loss.item()
-    print(f'Training Loss: {running_loss / len(training_dataloader):.4f}')
+    avg_loss = running_loss / len(training_dataloader)
+    training_losses.append(avg_loss)
+    print(f'Training Loss: {avg_loss:.4f}')
 
 def validate_model(validation_dataloader):
     model.eval()
@@ -40,7 +45,9 @@ def validate_model(validation_dataloader):
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
     accuracy = 100 * correct / total
-    print(f'Validation Loss: {running_loss / len(validation_dataloader):.4f}')
+    avg_loss = running_loss / len(validation_dataloader)
+    validation_losses.append(avg_loss)
+    print(f'Validation Loss: {avg_loss:.4f}')
     print(f'Validation Accuracy: {accuracy:.2f}%')
 
 def test_model(test_dataloader):
@@ -56,9 +63,9 @@ def test_model(test_dataloader):
     accuracy = 100 * correct / total
     print(f'Test Accuracy: {accuracy:.2f}%')
 
-training_dataloader = DataLoader(StructureDataset(training_data, training_labels), batch_size=batch_size, shuffle=True)
-validation_dataloader = DataLoader(StructureDataset(validation_data, validation_labels), batch_size=batch_size, shuffle=False)
-test_dataloader = DataLoader(StructureDataset(test_data, test_labels), shuffle=False)
+training_dataloader = DataLoader(StructureDataset("train_data.csv"), batch_size=batch_size, shuffle=True)
+validation_dataloader = DataLoader(StructureDataset("validation_data.csv"), batch_size=batch_size, shuffle=False)
+test_dataloader = DataLoader(StructureDataset("test_data.csv"), shuffle=False)
 for epoch in range(num_epochs):
     print(f'Epoch {epoch + 1}/{num_epochs}')
     train_model(training_dataloader)
@@ -73,6 +80,9 @@ plt.ylabel('Loss')
 plt.title('Training and Validation Loss')
 plt.legend()
 plt.show()
-test_model(test_dataloader)
 
-torch.save(model.state_dict(), 'structure_classifier.pth')
+if input("\n\nSTART TESTING? [Y,N] ") == 'Y':
+  test_model(test_dataloader)
+
+if input("\n\nSAVE MODEL? [Y,N] ") == 'Y':
+  torch.save(model.state_dict(), 'structure_classifier.pth')

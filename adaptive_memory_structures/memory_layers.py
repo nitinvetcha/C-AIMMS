@@ -48,11 +48,21 @@ class DummyEmbedder:
 # Selector protocol – plug in trained MLP classifier
 # ---------------------------------------------------------------------------
 
-@runtime_checkable
-class StructureSelector(Protocol):
+from structure_classifier_class StructureClassifier
+
+class StructureSelector():
+    options = ['linear', 'graph', 'hierarchical']
+    def __init__(self, pth_file):
+      self.model = StructureClassifier()
+      state_dict = torch.load(pth_file, weights_only=False)
+      self.model.load_state_dict(state_dict)
+      self.model.eval()
+    
     def predict(self, features: np.ndarray) -> str:
         """Return one of: 'linear', 'graph', 'hierarchical'."""
-        ...
+        with torch.no_grad():
+          res = torch.argmax(self.model(features).squeeze(0))
+        return options[res]
 
 
 class DefaultSelector:
