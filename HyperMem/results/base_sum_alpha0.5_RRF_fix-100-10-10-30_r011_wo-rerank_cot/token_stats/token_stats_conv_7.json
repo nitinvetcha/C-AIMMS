@@ -1,0 +1,17 @@
+{
+  "conv_id": "7",
+  "response_generation": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "call_count": 0,
+    "total_duration": 0.0
+  },
+  "total": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "call_count": 0,
+    "total_duration": 0.0
+  }
+}
