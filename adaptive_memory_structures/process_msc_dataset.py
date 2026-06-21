@@ -63,7 +63,7 @@ class DatasetEvaluator:
             if (row["speaker"][i] == 'Speaker 2'):
                 agent_text = row["dialogue"][i]
                 i += 1
-            timestamp += SECONDS_TO_WRITE_PER_WORD*len(user_text.split()) + SECONDS_TO_READ_PER_WORD*len(agent_text.split())
+            timestamp += self.SECONDS_TO_WRITE_PER_WORD*len(user_text.split()) + self.SECONDS_TO_READ_PER_WORD*len(agent_text.split())
             ep.append(Page(user_text=user_text, agent_text=agent_text, timestamp=timestamp ,embedding=qwen.embed("USER: " + user_text + "\nAGENT: " + agent_text)))            
 
         features = extract_features(ep)
@@ -103,6 +103,7 @@ def main():
         df = df.sort_values(by=["dialoug_id", "session_id"]).reset_index(drop=True)
         dataset_evaluator = DatasetEvaluator()
         df.iloc[0:5].apply(dataset_evaluator.eval_row, axis=1)
-        dataset_evaluator.save_to_csv(f"{w}_data.csv") 
+        dataset_evaluator.save_to_csv(f"{w}_data.csv")
+        print(f"Saved {w} dataset!") 
 
 main()
