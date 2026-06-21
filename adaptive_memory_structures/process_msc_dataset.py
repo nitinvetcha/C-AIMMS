@@ -34,7 +34,6 @@ from datasets import load_dataset
 from qwen_client import QwenClient
 qwen = QwenClient.load("Qwen/Qwen3-4B")
 
-
 class DatasetEvaluator:
     SECONDS_TO_READ_PER_WORD = 0.25
     SECONDS_TO_WRITE_PER_WORD = 1
@@ -88,7 +87,7 @@ class DatasetEvaluator:
             'structure': label
         }
         self.all_rows.append(res)
-    
+
     def save_to_csv(self, fileName: str):
         pd.DataFrame(self.all_rows).to_csv(fileName, index=False)
 
@@ -104,6 +103,6 @@ def main():
         dataset_evaluator = DatasetEvaluator()
         df.iloc[0:5].apply(dataset_evaluator.eval_row, axis=1)
         dataset_evaluator.save_to_csv(f"{w}_data.csv")
-        print(f"Saved {w} dataset!") 
+        print(f"Saved {w} dataset!")
 
 main()

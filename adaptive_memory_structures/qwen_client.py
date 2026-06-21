@@ -131,8 +131,8 @@ class QwenConfig:
     max_new_tokens: int     = 512
     temperature: float      = 0.0
     top_p: float            = 0.9
-    embed_max_length: int   = 512
-    embed_cache_size: int   = 1024
+    embed_max_length: int   = 256
+    embed_cache_size: int   = 512
     enable_thinking: bool   = False        # False = fast non-thinking mode
     trust_remote_code: bool = True
 
@@ -468,7 +468,9 @@ class QwenClient:
         -------
             reply = qwen.chat("Summarise this.", system="Be concise.")
         """
-        return self.generate(user, system=system, **generate_kwargs).text
+        response = self.generate(user, system=system, **generate_kwargs)
+        print(f"Qwen-speed: {response.completion_tokens / (response.latency_ms / 1000.0)}")
+        return response.text
 
     # ------------------------------------------------------------------
     # Batch generation
