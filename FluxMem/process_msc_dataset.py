@@ -33,7 +33,7 @@ from datasets import load_dataset
 
 import logging
 logging.basicConfig(
-    filename='failed_rows.log', 
+    filename='data_processing.log', 
     filemode='w', 
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -61,11 +61,11 @@ class DatasetEvaluator:
         i=0
         while i<n:
             user_text = ""
-            if (speakers[i] == 'Speaker 1'):
+            if (i<n and speakers[i] == 'Speaker 1'):
                 user_text = dialogue[i]
                 i += 1
             agent_text = ""
-            if (speakers[i] == 'Speaker 2'):
+            if (i<n and speakers[i] == 'Speaker 2'):
                 agent_text = dialogue[i]
                 i += 1
             timestamp += self.SECONDS_TO_WRITE_PER_WORD*len(user_text.split()) + self.SECONDS_TO_READ_PER_WORD*len(agent_text.split())
@@ -114,7 +114,7 @@ class DatasetEvaluator:
         res = feature_dict | label_dict
         self.all_rows.append(res)
 
-    def multi_rows(self, rows):
+    def multi_rows_feature_ex(self, rows):
         import json
         all_page_lists = []
         all_prompts = []
@@ -124,11 +124,27 @@ class DatasetEvaluator:
           all_prompts.append(self.feature_extractor.build_user_prompt(ep))
         responses = qwen.generate_batch(system=FeatureExtractor.system_prompt, prompts=all_prompts, max_new_tokens=2048)
         for i in range(len(rows)):
+          info = None
           try:
             info = json.loads(responses[i].text)
-            self.all_rows.append(self.get_features_dict(all_page_lists[i], info))
           except Exception as e:
-            logger.error(f"#{i} Dialogue {rows.iloc[i, 1]}, Session: {rows.iloc[i, 2]} data extraction failed. MSG: {str(e)}\n LLM Response: {responses[i].text}\n")
+            logger.warning(f"RETRYING #{i} Dialogue {rows.iloc[i, 1]}, Session: {rows.iloc[i, 2]}. MSG: {str(e)}\n LLM Response: {responses[i].text}\n")
+            try:
+              retry_res = qwen.chat(user=all_prompts[i], system=FeatureExtractor.system_prompt_reduced_info, max_tokens=2048)
+              info = json.loads(retry_res)
+            except Exception as e:
+              logger.error(f"#{i} Dialogue {rows.iloc[i, 1]}, Session: {rows.iloc[i, 2]} data extraction failed. MSG: {str(e)}\n LLM Response: {retry_res}\n")
+              continue
+          self.all_rows.append(self.get_features_dict(all_page_lists[i], info))
+
+    def eval_label_only(row):
+        ep = self.construct_page_list(dialogue=row["dialogue"], speakers=row["speaker"])
+        try:
+          label_dict = self.get_label_dict(ep, row["persona1"], row["persona2"])
+        except Exception as e:
+            logger.error(f"Dialogue {row["dialoug_id"]}, Session: {row["session_id"]} data extraction failed. MSG: {str(e)}")
+            return
+        self.all_rows.append(label_dict)
 
     def save_to_csv(self, fileName: str):
         pd.DataFrame(self.all_rows).to_csv(fileName, index=False)
@@ -144,7 +160,10 @@ def main():
         df = df.sort_values(by=["dialoug_id", "session_id"]).reset_index(drop=True)
         dataset_evaluator = DatasetEvaluator()
         #df.iloc[0:5].apply(dataset_evaluator.eval_row, axis=1)
-        dataset_evaluator.multi_rows(df.iloc[0:5])
+        j=0
+        while j<100:
+          dataset_evaluator.multi_rows_feature_ex(df.iloc[j:(j+16)])
+          j+=16
         dataset_evaluator.save_to_csv(f"{w}_data.csv")
         print(f"Saved {w} dataset!")
 
