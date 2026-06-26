@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Tuple
 
 from iterret import evaluator, learner
 from iterret.ctc_graph import CueTagContentGraph
+from iterret.episode_segmenter import add_surprise_cli_args, segmenter_from_args
 from iterret.experience_bank import (
     ExperienceBank,
     build_default_embedding_backend,
@@ -45,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-iterations", type=int, default=5)
     parser.add_argument("--question", default=None,
                          help="Override the online-stage question (default: first held-out sample question).")
+    add_surprise_cli_args(parser)
     return parser.parse_args()
 
 
@@ -75,9 +77,13 @@ def offline_build_graph(args: argparse.Namespace) -> CueTagContentGraph:
         print(f"  [{i:>2}] ({t.get('time')}) {t['speaker']}: {t['text']}")
 
     llm = make_llm(args)
-    graph = build_ctc_graph_from_dialogue(turns, llm)
+    segmenter = segmenter_from_args(args)
+    if segmenter is not None:
+        print(f"\n(surprise segmentation ON, model={args.surprise_model}: the episodic layer below")
+        print(" groups consecutive turns into surprise-bounded events instead of one-per-turn)")
+    graph = build_ctc_graph_from_dialogue(turns, llm, segmenter=segmenter)
 
-    _sub("Result -- episodic layer (one per turn: F_tag_LLM + F_cue_LLM, Eq. 6)")
+    _sub("Result -- episodic layer (one node per surprise-bounded event: F_tag_LLM + F_cue_LLM, Eq. 6)")
     for cid, node in sorted(graph.contents.items()):
         if node.layer != "episodic":
             continue

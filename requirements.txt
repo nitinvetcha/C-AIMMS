@@ -4,3 +4,9 @@
 langgraph==1.2.5
 openai==2.43.0
 sentence-transformers>=3.0
+
+# Optional: only needed for --surprise-segmentation (iterret.episode_segmenter /
+# iterret.surprise). These pull in a local HuggingFace causal LM to compute token
+# surprisal; a GPU is strongly recommended. The core pipeline runs without them.
+torch>=2.1
+transformers>=4.40

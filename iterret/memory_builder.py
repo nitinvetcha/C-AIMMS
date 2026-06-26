@@ -3,20 +3,21 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import Iterator, List, Optional, TypedDict
+from typing import Iterator, List, Optional, Protocol, Sequence, TypedDict
 
 from .ctc_graph import CueTagContentGraph
 from .json_utils import parse_json_object
 from .llm_client import LLMClient
 
 _EPISODE_EXTRACTION_SYSTEM_PROMPT = """episode_extraction
-You build a Cue-Tag-Episode memory graph (MRAgent style) from one dialogue
-turn. Read the turn and produce:
+You build a Cue-Tag-Episode memory graph (MRAgent style) from a dialogue
+segment (one or more consecutive turns that form a single coherent event).
+Read the segment and produce:
 - "tag": a short phrase (<=4 words) summarizing the relational pattern of
   this episode (e.g. "Pet Adoption", "Job Change").
 - "cues": a list of fine-grained cues -- entities, names, attributes, or
-  salient descriptors explicitly mentioned in the turn (e.g. speaker name,
-  named entities, key nouns). 2-6 cues.
+  salient descriptors explicitly mentioned in the segment (e.g. speaker
+  names, named entities, key nouns). 2-6 cues.
 Reply as JSON: {"tag": str, "cues": [str, ...]}.
 """
 
@@ -48,6 +49,15 @@ class DialogueTurn(TypedDict, total=False):
     speaker: str
     text: str
     time: Optional[str]
+
+
+class EpisodeSegmenter(Protocol):
+    """Anything that groups turns into events (lists of consecutive turn
+    indices). ``iterret.episode_segmenter.SurpriseEpisodeSegmenter`` is the
+    surprise-based implementation; the structural typing here keeps
+    memory_builder free of any torch/transformers import."""
+
+    def segment(self, turns: Sequence[DialogueTurn]) -> List[List[int]]: ...
 
 
 def _warn(message: str) -> None:
@@ -84,13 +94,27 @@ def _iter_chunks(items: List[dict], *, text_key: str, max_chars: int) -> Iterato
         yield batch
 
 
-def _extract_episode(turn: DialogueTurn, llm: LLMClient) -> dict:
-    parsed = _safe_chat(_EPISODE_EXTRACTION_SYSTEM_PROMPT, json.dumps(dict(turn)), llm,
-                         on_error="episode extraction failed, using fallback tag/cues")
+def _event_text(event_turns: List[DialogueTurn]) -> str:
+    """The text shown to the LLM and stored on the episodic node: one
+    ``Speaker: text`` line per constituent turn. For a single-turn event this
+    is exactly the old per-turn episodic text."""
+    return "\n".join(f"{t.get('speaker', 'Unknown')}: {t.get('text', '')}" for t in event_turns)
+
+
+def _extract_event(event_turns: List[DialogueTurn], llm: LLMClient) -> dict:
+    """Extract one (tag, cues) set for a whole event (a group of >=1 turns).
+
+    Every distinct speaker in the event is forced in as a cue, mirroring the
+    per-turn behaviour this generalises."""
+    speakers: List[str] = list(dict.fromkeys(t["speaker"] for t in event_turns if t.get("speaker")))
+    payload = {"speakers": speakers, "text": _event_text(event_turns)}
+    parsed = _safe_chat(_EPISODE_EXTRACTION_SYSTEM_PROMPT, json.dumps(payload), llm,
+                         on_error="event extraction failed, using fallback tag/cues")
     tag = str(parsed.get("tag") or "Mention")
     cues = [str(c) for c in parsed.get("cues") or [] if str(c).strip()]
-    if turn.get("speaker") and turn["speaker"] not in cues:
-        cues.append(turn["speaker"])
+    for speaker in speakers:
+        if speaker not in cues:
+            cues.append(speaker)
     if not cues:
         cues = ["Unknown"]
     return {"tag": tag, "cues": cues}
@@ -133,6 +157,7 @@ def _abstract_topics(episode_summaries: List[dict], llm: LLMClient, *, max_chars
 
 def build_ctc_graph_from_dialogue(
     turns: List[DialogueTurn], llm: LLMClient, *, max_chars_per_call: int = DEFAULT_MAX_CHARS_PER_CALL,
+    segmenter: Optional[EpisodeSegmenter] = None,
 ) -> CueTagContentGraph:
     """Run all three distillation stages and assemble the CTC graph.
 
@@ -140,17 +165,29 @@ def build_ctc_graph_from_dialogue(
     topic stages pack into a single LLM call (see module docstring); lower
     it if your server's context window is smaller than ~8k tokens, raise
     it (carefully) if it's much larger and you want fewer, larger calls.
+
+    ``segmenter`` controls episodic granularity. Without one, each turn is its
+    own episode (the original MRAgent-style behaviour). With one (e.g. the
+    surprise-based ``SurpriseEpisodeSegmenter``), consecutive turns belonging
+    to the same surprise-bounded *event* collapse into a single episodic node.
     """
     graph = CueTagContentGraph()
     episode_summaries: List[dict] = []
 
-    # 1. Episodic layer: one (cue, tag, episode) set of links per turn.
-    for i, turn in enumerate(turns):
+    # 1. Episodic layer: one (cue, tag, episode) set of links per event.
+    #    An "event" is a group of consecutive turns; with no segmenter that
+    #    group is a single turn, reproducing the original per-turn layer.
+    events: List[List[int]] = (
+        segmenter.segment(turns) if segmenter is not None else [[i] for i in range(len(turns))]
+    )
+    for i, turn_indices in enumerate(events):
         content_id = f"e{i + 1}"
-        text = f"{turn.get('speaker', 'Unknown')}: {turn.get('text', '')}"
-        graph.add_content(content_id, text, layer="episodic", time=turn.get("time"))
+        event_turns = [turns[t] for t in turn_indices]
+        text = _event_text(event_turns)
+        time = event_turns[0].get("time") if event_turns else None
+        graph.add_content(content_id, text, layer="episodic", time=time)
 
-        extracted = _extract_episode(turn, llm)
+        extracted = _extract_event(event_turns, llm)
         for cue in extracted["cues"]:
             graph.link(cue, extracted["tag"], content_id)
 

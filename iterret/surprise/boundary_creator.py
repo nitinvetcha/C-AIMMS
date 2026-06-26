@@ -1,6 +1,6 @@
 import torch
 from typing import Tuple, List, Optional
-from similarity_refinement import events_with_similarity_adjustment
+from .similarity_refinement import events_with_similarity_adjustment
 
 class SurpriseBoundaryPipeline:
     """

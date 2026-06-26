@@ -7,9 +7,10 @@ import time
 from typing import Any, Dict, List, Optional
 
 from iterret import evaluator
+from iterret.episode_segmenter import add_surprise_cli_args, segmenter_from_args
 from iterret.experience_bank import ExperienceBank, build_default_embedding_backend
 from iterret.graph import build_graph
-from iterret.llm_client import LLMClient, MockLLMClient, OpenAICompatibleLLMClient
+from iterret.llm_client import LLMClient, MockLLMClient, OpenAICompatibleLLMClient, TransformersLLMClient
 from iterret.llm_judge import judge_answer
 from iterret.locomo_data import (
     CATEGORY_NAMES,
@@ -39,6 +40,13 @@ def parse_args() -> argparse.Namespace:
                          help="Use a local OpenAI-compatible LLM server instead of the mock.")
     parser.add_argument("--llm-base-url", default=None)
     parser.add_argument("--llm-model", default=None)
+    parser.add_argument("--local-hf-llm", action="store_true",
+                         help="Run the answering LLM in-process via transformers (no server / no vLLM). "
+                              "Use when vLLM won't install against your driver.")
+    parser.add_argument("--hf-llm-model", default="Qwen/Qwen3-4B-Instruct-2507",
+                         help="HF model id for --local-hf-llm (default %(default)s).")
+    parser.add_argument("--hf-llm-device", default=None,
+                         help="Device for --local-hf-llm (e.g. cuda:0); default auto-detect.")
     parser.add_argument("--bootstrap-fraction", type=float, default=0.1,
                          help="Fraction of conversations used to build the offline memory/experience "
                               "bank; the rest are held out for evaluation (default 0.1, i.e. 10%%).")
@@ -68,6 +76,7 @@ def parse_args() -> argparse.Namespace:
                          help="If set, save each conversation's CTC graph and the shared experience "
                               "bank as JSON under this directory for inspection/reuse.")
     parser.add_argument("--output", default=None, help="Path to dump full per-question results as JSON.")
+    add_surprise_cli_args(parser)
     return parser.parse_args()
 
 
@@ -85,13 +94,15 @@ def resolve_locomo_path(cli_value: Optional[str]) -> str:
 def build_offline_memory(
     bootstrap_raw: list, llm: LLMClient, *, max_turns: Optional[int], categories: tuple,
     bootstrap_questions_per_conv: int, max_iterations: int, max_chars_per_call: int,
+    segmenter=None,
 ) -> ExperienceBank:
     all_records: List[Dict[str, Any]] = []
     for raw_conv in bootstrap_raw:
         conv = parse_conversation(raw_conv, max_turns=max_turns, categories=categories,
                                    max_questions=bootstrap_questions_per_conv)
         print(f"[bootstrap] {conv['sample_id']}: distilling {len(conv['turns'])} turn(s) into a CTC graph...")
-        graph = build_ctc_graph_from_dialogue(conv["turns"], llm, max_chars_per_call=max_chars_per_call)
+        graph = build_ctc_graph_from_dialogue(conv["turns"], llm, max_chars_per_call=max_chars_per_call,
+                                              segmenter=segmenter)
 
         seed_questions = [q["question"] for q in conv["questions"]]
         print(f"[bootstrap] {conv['sample_id']}: collecting {len(seed_questions)} unguided trajectory(ies)...")
@@ -182,10 +193,21 @@ def main() -> None:
     locomo_path = resolve_locomo_path(args.locomo_path)
     categories = tuple(int(c) for c in args.categories.split(",") if c.strip())
 
-    llm = (OpenAICompatibleLLMClient(base_url=args.llm_base_url, model=args.llm_model)
-           if args.use_real_llm else MockLLMClient())
-    if args.use_real_llm:
+    if args.local_hf_llm:
+        print(f"[setup] loading in-process transformers LLM (model={args.hf_llm_model}) -- no server/vLLM")
+        llm: LLMClient = TransformersLLMClient(args.hf_llm_model, device=args.hf_llm_device)
+    elif args.use_real_llm:
+        llm = OpenAICompatibleLLMClient(base_url=args.llm_base_url, model=args.llm_model)
         print(f"[setup] using real LLM at {llm.base_url} (model={llm.model})")
+    else:
+        llm = MockLLMClient()
+
+    # One segmenter (one loaded model) shared across all conversations; its
+    # segment() resets rolling state per call, so no state bleeds between them.
+    segmenter = segmenter_from_args(args)
+    if segmenter is not None:
+        print(f"[setup] surprise segmentation ON (model={args.surprise_model}, gamma={args.surprise_gamma}): "
+              f"episodes are surprise-bounded events, not turns")
 
     print(f"[setup] loading {locomo_path}")
     raw_conversations = load_raw_locomo(locomo_path)
@@ -198,7 +220,7 @@ def main() -> None:
     bank = build_offline_memory(
         bootstrap_raw, llm, max_turns=args.max_turns_per_conversation, categories=categories,
         bootstrap_questions_per_conv=args.bootstrap_questions_per_conv, max_iterations=args.max_iterations,
-        max_chars_per_call=args.max_chars_per_call,
+        max_chars_per_call=args.max_chars_per_call, segmenter=segmenter,
     )
 
     if args.save_graphs_dir:
@@ -211,7 +233,8 @@ def main() -> None:
                                    max_questions=args.max_questions_per_conversation)
         print(f"\n[eval] {conv['sample_id']}: distilling {len(conv['turns'])} turn(s) into a CTC graph, "
               f"then answering {len(conv['questions'])} question(s)...")
-        graph = build_ctc_graph_from_dialogue(conv["turns"], llm, max_chars_per_call=args.max_chars_per_call)
+        graph = build_ctc_graph_from_dialogue(conv["turns"], llm, max_chars_per_call=args.max_chars_per_call,
+                                              segmenter=segmenter)
         if args.save_graphs_dir:
             graph.save(os.path.join(args.save_graphs_dir, f"{conv['sample_id']}_ctc_graph.json"))
 

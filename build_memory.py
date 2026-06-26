@@ -5,6 +5,7 @@ import json
 import os
 
 from iterret.ctc_graph import CueTagContentGraph
+from iterret.episode_segmenter import add_surprise_cli_args, segmenter_from_args
 from iterret.llm_client import MockLLMClient, OpenAICompatibleLLMClient
 from iterret.memory_builder import DEFAULT_MAX_CHARS_PER_CALL, DialogueTurn, build_ctc_graph_from_dialogue
 
@@ -24,6 +25,7 @@ def parse_args() -> argparse.Namespace:
                               "extraction LLM call (default %(default)s; lower this for smaller "
                               "context-window servers, e.g. a -2507-tagged Qwen3 server run with "
                               "--max-model-len 8192).")
+    add_surprise_cli_args(parser)
     return parser.parse_args()
 
 
@@ -47,7 +49,13 @@ def main() -> None:
     if args.use_real_llm:
         print(f"[memory-builder] using real LLM at {llm.base_url} (model={llm.model})")
 
-    graph = build_ctc_graph_from_dialogue(turns, llm, max_chars_per_call=args.max_chars_per_call)
+    segmenter = segmenter_from_args(args)
+    if segmenter is not None:
+        print(f"[memory-builder] surprise segmentation ON (model={args.surprise_model}, "
+              f"gamma={args.surprise_gamma}): episodes are surprise-bounded events, not turns")
+
+    graph = build_ctc_graph_from_dialogue(turns, llm, max_chars_per_call=args.max_chars_per_call,
+                                          segmenter=segmenter)
     graph.save(graph_path)
 
     n_cues = len(graph.cues)

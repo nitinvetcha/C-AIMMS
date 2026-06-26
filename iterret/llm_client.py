@@ -73,6 +73,50 @@ class OpenAICompatibleLLMClient(LLMClient):
         return response.choices[0].message.content or ""
 
 
+class TransformersLLMClient(LLMClient):
+    """Runs the answering LLM locally via HuggingFace ``transformers`` -- no
+    server, no vLLM. One process loads the chat model (and, alongside it, the
+    surprise segmenter can share the same GPU). Slower than vLLM (no batching),
+    but it sidesteps vLLM/torch/CUDA wheel-matching entirely, which is the right
+    trade when vLLM won't install against the node's driver.
+
+    Heavy imports are lazy (inside __init__), so importing this module stays
+    free of a torch/transformers dependency.
+    """
+
+    def __init__(self, model_name_or_path: str = "Qwen/Qwen3-4B-Instruct-2507",
+                 device=None, max_tokens: int = 1024) -> None:
+        import torch  # noqa: PLC0415
+        from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
+
+        self._torch = torch
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        self.device = torch.device(device) if isinstance(device, str) else device
+        dtype = torch.float16 if self.device.type in ("cuda", "mps") else torch.float32
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=dtype)
+        self.model.to(self.device).eval()
+        self.max_tokens = max_tokens
+
+    def chat(self, system_prompt: str, user_prompt: str, *, temperature: float = 0.0) -> str:
+        torch = self._torch
+        messages = [{"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}]
+        input_ids = self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt",
+        ).to(self.device)
+        with torch.no_grad():
+            out = self.model.generate(
+                input_ids,
+                max_new_tokens=self.max_tokens,
+                do_sample=temperature > 0,
+                temperature=temperature if temperature > 0 else None,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+        return self.tokenizer.decode(out[0][input_ids.shape[1]:], skip_special_tokens=True)
+
+
 class MockLLMClient(LLMClient):
     """Deterministic, stateful mock so the whole pipeline (offline + online)
     runs without a real model. It inspects the prompt for a handful of
