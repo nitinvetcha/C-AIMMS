@@ -1,5 +1,10 @@
 """
-FluxMem Memory Structures
+NOTE: THIS FILE MUST BE REPLACED WITH THE ACTUAL MEMORY STRUCTURES USED. THIS CURRENTLY IMPLEMENTS THE ORIGINAL FLUXMEM PAPER MEMORY STRUCTURES.
+"""
+
+
+"""
+FluxMem Memory Structures 
 Implements linear, graph, and hierarchical memory organization for MTEM episodic units.
 Based on: "Choosing How to Remember: Adaptive Memory Structures for LLM Agents"
 """
