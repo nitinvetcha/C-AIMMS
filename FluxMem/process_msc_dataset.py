@@ -114,7 +114,7 @@ class DatasetEvaluator:
         res = feature_dict | label_dict
         self.all_rows.append(res)
 
-    def multi_rows_feature_ex(self, rows):
+    def multi_rows(self, rows):
         import json
         all_page_lists = []
         all_prompts = []
@@ -129,15 +129,15 @@ class DatasetEvaluator:
             info = json.loads(responses[i].text)
           except Exception as e:
             logger.warning(f"RETRYING #{i} Dialogue {rows.iloc[i, 1]}, Session: {rows.iloc[i, 2]}. MSG: {str(e)}\n LLM Response: {responses[i].text}\n")
+            retry_res = qwen.chat(user=all_prompts[i], system=FeatureExtractor.system_prompt_reduced_info, max_new_tokens=2048)
             try:
-              retry_res = qwen.chat(user=all_prompts[i], system=FeatureExtractor.system_prompt_reduced_info, max_tokens=2048)
               info = json.loads(retry_res)
             except Exception as e:
               logger.error(f"#{i} Dialogue {rows.iloc[i, 1]}, Session: {rows.iloc[i, 2]} data extraction failed. MSG: {str(e)}\n LLM Response: {retry_res}\n")
               continue
           self.all_rows.append(self.get_features_dict(all_page_lists[i], info))
 
-    def eval_label_only(row):
+    def eval_label_only(self, row):
         ep = self.construct_page_list(dialogue=row["dialogue"], speakers=row["speaker"])
         try:
           label_dict = self.get_label_dict(ep, row["persona1"], row["persona2"])
@@ -153,6 +153,9 @@ class DatasetEvaluator:
 def main():
     dataset = load_dataset("nayohan/multi_session_chat")
 
+    j_start = 0
+    j_end = 1000
+
     for w in ["train", "validation", "test"]:
         df = pd.DataFrame(dataset[w])
         df['dialoug_id'] = pd.to_numeric(df['dialoug_id'])
@@ -160,11 +163,11 @@ def main():
         df = df.sort_values(by=["dialoug_id", "session_id"]).reset_index(drop=True)
         dataset_evaluator = DatasetEvaluator()
         #df.iloc[0:5].apply(dataset_evaluator.eval_row, axis=1)
-        j=0
-        while j<100:
-          dataset_evaluator.multi_rows_feature_ex(df.iloc[j:(j+16)])
+        j=j_start
+        while j<j_end:
+          dataset_evaluator.multi_rows(df.iloc[j:(j+16)])
           j+=16
-        dataset_evaluator.save_to_csv(f"{w}_data.csv")
+        dataset_evaluator.save_to_csv(f"{w}_data_features_{j_start}_to_{j_end}.csv")
         print(f"Saved {w} dataset!")
 
 main()
