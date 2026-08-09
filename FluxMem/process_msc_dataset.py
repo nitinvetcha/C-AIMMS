@@ -44,6 +44,10 @@ logger.setLevel(logging.DEBUG)
 from qwen_client import QwenClient, QwenConfig
 qwen = QwenClient.load(config=QwenConfig(model_path="Qwen/Qwen3-4B", enable_thinking=False))
 
+#batches of 1000 to reduce GPU load (1000 rows take approx. 8 hours on Mahamathi Cluster)
+j_start = 0
+j_end = 1000
+
 class DatasetEvaluator:
     SECONDS_TO_READ_PER_WORD = 0.25
     SECONDS_TO_WRITE_PER_WORD = 1
@@ -152,9 +156,6 @@ class DatasetEvaluator:
 
 def main():
     dataset = load_dataset("nayohan/multi_session_chat")
-
-    j_start = 0
-    j_end = 1000
 
     for w in ["train", "validation", "test"]:
         df = pd.DataFrame(dataset[w])
