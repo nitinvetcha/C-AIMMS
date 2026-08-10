@@ -152,19 +152,15 @@ class SurpriseEpisodeSegmenter:
             all_ids.extend(ids)
         return all_ids, turn_starts
 
-    def segment(self, turns: Sequence[dict]) -> List[List[int]]:
-        """Segment ``turns`` into events; each event is a list of turn indices."""
-        if not turns:
-            return []
-        n_turns = len(turns)
+    def emit_episodes(self, token_ids: Sequence[int]) -> List[Tuple[int, int]]:
+        """Run the surprise emitter over a raw token-id stream and return the
+        (start, end) token spans it emits. Resets rolling state first, so calls
+        are independent. Shared by dialogue segmentation (which snaps the spans'
+        ends to turn boundaries) and document segmentation (which uses the raw
+        spans directly, EM-LLM's native mode)."""
         self.reset()
-
-        all_ids, turn_starts = self._render_and_tokenize(turns)
-        if not all_ids:
-            return [list(range(n_turns))]
-
         torch = self._torch
-        input_ids = torch.tensor([all_ids], dtype=torch.long, device=self.device)
+        input_ids = torch.tensor([list(token_ids)], dtype=torch.long, device=self.device)
         total = input_ids.shape[1]
 
         past_key_values = None
@@ -173,13 +169,24 @@ class SurpriseEpisodeSegmenter:
                 chunk = input_ids[:, start:start + self.chunk_size]
                 outputs = self.emitter(
                     input_ids=chunk,
-                    labels=chunk,  # teacher-force surprisal against the real transcript
+                    labels=chunk,  # teacher-force surprisal against the real text
                     past_key_values=past_key_values,
                     use_cache=True,
                 )
                 past_key_values = outputs.past_key_values
 
-        episodes = self.emitter.get_new_episodes()
+        return self.emitter.get_new_episodes()
+
+    def segment(self, turns: Sequence[dict]) -> List[List[int]]:
+        """Segment ``turns`` into events; each event is a list of turn indices."""
+        if not turns:
+            return []
+        n_turns = len(turns)
+        all_ids, turn_starts = self._render_and_tokenize(turns)
+        if not all_ids:
+            return [list(range(n_turns))]
+
+        episodes = self.emit_episodes(all_ids)
         cut_indices = sorted({end for _start, end in episodes})
         return build_turn_events(cut_indices, turn_starts, n_turns)
 

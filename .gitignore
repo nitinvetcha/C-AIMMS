@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+
+# Datasets (download separately)
+data/
+
+# Result artifacts / run outputs
+locomo_results*/
+longbench_results/
+emllm_results/
+*_surprise.json
+*_baseline.json
+
+# Papers / large binaries
+*.pdf
+
+# HF cache
+.hf_cache/

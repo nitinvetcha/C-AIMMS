@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Literal
 
 from .ctc_graph import CueTagContentGraph
@@ -54,7 +55,30 @@ Reply as JSON: {"kept_content_ids": "ALL" or [str, ...], "resolved_gaps": [str, 
 _ANSWER_SYSTEM_PROMPT = """final_answer
 Synthesize a final answer to the question using ONLY the provided evidence
 bullets. Do not reference gaps, search trajectory, or graph internals.
+
+Answer as concisely as possible: give ONLY the direct answer -- a short phrase,
+a name, a number, or at most one short sentence. Do NOT restate the question,
+do NOT list the evidence bullets, and do NOT explain your reasoning. If the
+evidence does not contain the answer, reply exactly: unanswerable.
 """
+
+# Some models (e.g. Qwen3 in thinking mode) wrap reasoning in <think>...</think>.
+# That must never leak into final_answer -- it destroys token-F1 (the trace is
+# hundreds of tokens vs a few-word gold answer) and, when the token budget is
+# exhausted mid-thought, leaves a dangling unterminated <think> with no answer.
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_think(text: str) -> str:
+    """Remove <think>...</think> blocks and any unterminated trailing <think>
+    tail, returning only the visible answer."""
+    if not text:
+        return text
+    text = _THINK_RE.sub("", text)
+    idx = text.lower().rfind("<think>")  # unterminated tail (ran out of tokens)
+    if idx != -1:
+        text = text[:idx]
+    return text.strip()
 
 
 def abstract_situation(condition: str, llm: LLMClient) -> str:
@@ -69,7 +93,16 @@ def retrieve_node(state: IterRetState, graph: CueTagContentGraph, bank: Experien
     active_set = state.setdefault("active_set", {"cues": [], "tags": [], "contents": []})
     visited = set(state.get("visited_content_ids", []))
 
-    if not active_set["cues"]:
+    if graph.semantic_enabled:
+        # Semantic seeding: re-match cues against the CURRENT (refined) query
+        # EVERY round and union them in -- so query refinement across iterations
+        # can expand/repair the anchor set (unlike the lexical path below, which
+        # seeds once and sticks). Needed for document QA, where the question
+        # rarely shares tokens with the answer's cues.
+        matched = graph.semantic_match_cues(query, max_matches=MAX_ACTIVE_CUES)
+        merged = list(dict.fromkeys(list(active_set["cues"]) + sorted(matched)))
+        active_set["cues"] = merged[:MAX_ACTIVE_CUES]
+    elif not active_set["cues"]:
         active_set["cues"] = sorted(graph.match_query_to_cues(query, max_matches=MAX_ACTIVE_CUES))
 
     # Planning experience retrieval (R2-Mem Eq. 12, c_i = q_i)
@@ -114,10 +147,19 @@ def retrieve_node(state: IterRetState, graph: CueTagContentGraph, bank: Experien
     # reading a long list pays the most attention to what's earliest in it -- re-sorting
     # alphabetically here would undo that by burying e.g. "LGBTQ Support Group" behind 50+
     # alphabetically-earlier but irrelevant tags before the model ever reads that far.
+    # Recall safety net: if cue-gated traversal surfaced nothing new this round,
+    # fall back to the most query-relevant unseen content directly (semantic
+    # only). Without this, an empty cue match guarantees an "unanswerable".
+    if graph.semantic_enabled and not new_contents:
+        new_contents = set(graph.semantic_fallback_contents(
+            query, top_k=MAX_NEW_CONTENT_PER_ROUND, exclude_content_ids=visited))
+
     active_set["tags"] = graph.rank_tags_by_relevance(new_tags, query)
     active_set["contents"] = sorted(set(active_set["contents"]) | new_contents)
 
-    state["_scratch_new_retrieval"] = graph.rank_contents_by_relevance(new_contents, query)
+    state["_scratch_new_retrieval"] = (
+        graph.semantic_rank_contents(new_contents, query) if graph.semantic_enabled
+        else graph.rank_contents_by_relevance(new_contents, query))
     state["active_set"] = active_set
     state["iteration_count"] = state.get("iteration_count", 0) + 1
 
@@ -233,7 +275,7 @@ def route_after_reflect(state: IterRetState) -> Literal["retrieve", "answer"]:
 def answer_node(state: IterRetState, llm: LLMClient) -> IterRetState:
     evidence_block = "\n".join(f"- {item}" for item in state.get("accumulated_evidence", []))
     user_prompt = f"Question: {state['original_query']}\nEvidence:\n{evidence_block}"
-    state["final_answer"] = llm.chat(_ANSWER_SYSTEM_PROMPT, user_prompt)
+    state["final_answer"] = _strip_think(llm.chat(_ANSWER_SYSTEM_PROMPT, user_prompt))
 
     trajectory = state.setdefault("search_trajectory", [])
     trajectory.append(SearchStep(

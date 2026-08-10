@@ -42,12 +42,24 @@ GAMMA="${GAMMA:-3.5}"                              # surprise threshold (see cal
 VLLM_TP="${VLLM_TP:-1}"                            # vLLM tensor-parallel size -> cuda:0..TP-1
 SURPRISE_DEVICE="${SURPRISE_DEVICE:-cuda:1}"       # dedicated GPU for the surprise model
 VLLM_MEM_UTIL="${VLLM_MEM_UTIL:-0.90}"             # lower (~0.55) when sharing ONE GPU with surprise
+VLLM_MAX_LEN="${VLLM_MAX_LEN:-32768}"              # 16384 is too small: IterRet packs ~15.5k input
+                                                   # tokens, so 16384-15513<1024 -> HTTP 400s. 32k fixes it.
+SEMANTIC="${SEMANTIC:-1}"                          # 1 = new system (embedding cue-match + relevance
+                                                   # fallback). Set SEMANTIC=0 for the lexical paper config.
 OUT_DIR="${OUT_DIR:-locomo_results_${SLURM_JOB_ID:-local}}"
 BASE_URL="http://localhost:${PORT}/v1"
 
 # ---- cluster environment (EDIT to match your site) ------------------------
-# module load cuda/12.4
-source .venv/bin/activate
+# Winning env (verified on catanzaro): Python 3.12 + cu12 vLLM 0.10.1.1 + transformers<5.
+# Python 3.13 has NO cu12 vLLM wheel (only cu13, which needs a CUDA-13 driver), and
+# Python 3.8 venvs are too old for Qwen3 (KeyError: 'qwen3'). So use a conda 3.12 env.
+# ONE-TIME setup on a login node (see the header comment block for the full recipe):
+#   conda create -y -n caimms312 python=3.12 && conda activate caimms312
+#   pip install "vllm==0.10.1.1" "transformers>=4.55,<5" \
+#       "langgraph==1.2.5" "openai==2.43.0" "sentence-transformers>=3.0"
+# module load cuda/12.8       # if your site requires it; match the node driver
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "${CONDA_ENV:-caimms312}"
 # If compute nodes have NO internet, pre-stage on a login node instead:
 #   - data/locomo10.json (curl below), and
 #   - HF model caches: HF_HOME=$PWD/.hf_cache and pre-pull MODEL + a
@@ -68,7 +80,7 @@ fi
 # 1. serve the answering LLM with vLLM (uses cuda:0..VLLM_TP-1) --------------
 echo "[slurm] starting vLLM (TP=$VLLM_TP) ..."
 vllm serve "$MODEL" --port "$PORT" --tensor-parallel-size "$VLLM_TP" \
-  --gpu-memory-utilization "$VLLM_MEM_UTIL" --max-model-len 16384 \
+  --gpu-memory-utilization "$VLLM_MEM_UTIL" --max-model-len "$VLLM_MAX_LEN" \
   > "$OUT_DIR/vllm.log" 2>&1 &
 VLLM_PID=$!
 trap 'echo "[slurm] stopping vLLM ($VLLM_PID)"; kill $VLLM_PID 2>/dev/null || true' EXIT
@@ -81,6 +93,8 @@ done
 echo "[slurm] vLLM ready."
 
 COMMON=( --locomo-path "$LOCOMO_PATH" --use-real-llm --llm-base-url "$BASE_URL" --llm-model "$MODEL" )
+[[ "$SEMANTIC" == "1" ]] && COMMON+=( --semantic-retrieval )
+echo "[slurm] semantic retrieval: $([[ "$SEMANTIC" == "1" ]] && echo ON || echo OFF)"
 
 # 2. gamma calibration on conversation 0 (aim for ~3-10 turns/event) ---------
 echo "[slurm] gamma calibration:"

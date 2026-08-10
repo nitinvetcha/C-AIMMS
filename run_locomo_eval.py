@@ -76,6 +76,9 @@ def parse_args() -> argparse.Namespace:
                          help="If set, save each conversation's CTC graph and the shared experience "
                               "bank as JSON under this directory for inspection/reuse.")
     parser.add_argument("--output", default=None, help="Path to dump full per-question results as JSON.")
+    parser.add_argument("--semantic-retrieval", action="store_true",
+                         help="Enable embedding-based cue matching + relevance fallback in retrieval "
+                              "(the 'new system'). Off by default so the lexical paper config is reproduced.")
     add_surprise_cli_args(parser)
     return parser.parse_args()
 
@@ -94,7 +97,7 @@ def resolve_locomo_path(cli_value: Optional[str]) -> str:
 def build_offline_memory(
     bootstrap_raw: list, llm: LLMClient, *, max_turns: Optional[int], categories: tuple,
     bootstrap_questions_per_conv: int, max_iterations: int, max_chars_per_call: int,
-    segmenter=None,
+    segmenter=None, embedder=None,
 ) -> ExperienceBank:
     all_records: List[Dict[str, Any]] = []
     for raw_conv in bootstrap_raw:
@@ -103,6 +106,8 @@ def build_offline_memory(
         print(f"[bootstrap] {conv['sample_id']}: distilling {len(conv['turns'])} turn(s) into a CTC graph...")
         graph = build_ctc_graph_from_dialogue(conv["turns"], llm, max_chars_per_call=max_chars_per_call,
                                               segmenter=segmenter)
+        if embedder is not None:
+            graph.attach_embedder(embedder)
 
         seed_questions = [q["question"] for q in conv["questions"]]
         print(f"[bootstrap] {conv['sample_id']}: collecting {len(seed_questions)} unguided trajectory(ies)...")
@@ -135,7 +140,12 @@ def evaluate_conversation(
         elapsed = time.time() - start
 
         f1 = token_f1(predicted, qa["answer"])
-        correct: Optional[bool] = judge_answer(qa["question"], qa["answer"], predicted, llm) if run_judge else None
+        correct: Optional[bool] = None
+        if run_judge:
+            try:  # a transient server hiccup on the judge call must not abort the whole run
+                correct = judge_answer(qa["question"], qa["answer"], predicted, llm)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[eval] warning: judge failed for one question, scoring it None: {exc}")
 
         results.append({
             "sample_id": conv["sample_id"],
@@ -209,6 +219,12 @@ def main() -> None:
         print(f"[setup] surprise segmentation ON (model={args.surprise_model}, gamma={args.surprise_gamma}): "
               f"episodes are surprise-bounded events, not turns")
 
+    embedder = None
+    if args.semantic_retrieval:
+        embedder = build_default_embedding_backend()
+        print(f"[setup] semantic retrieval ON (embedder={type(embedder).__name__}): "
+              "embedding cue matching + relevance fallback")
+
     print(f"[setup] loading {locomo_path}")
     raw_conversations = load_raw_locomo(locomo_path)
     bootstrap_raw, eval_raw = split_bootstrap_eval(raw_conversations, bootstrap_fraction=args.bootstrap_fraction)
@@ -220,7 +236,7 @@ def main() -> None:
     bank = build_offline_memory(
         bootstrap_raw, llm, max_turns=args.max_turns_per_conversation, categories=categories,
         bootstrap_questions_per_conv=args.bootstrap_questions_per_conv, max_iterations=args.max_iterations,
-        max_chars_per_call=args.max_chars_per_call, segmenter=segmenter,
+        max_chars_per_call=args.max_chars_per_call, segmenter=segmenter, embedder=embedder,
     )
 
     if args.save_graphs_dir:
@@ -235,6 +251,8 @@ def main() -> None:
               f"then answering {len(conv['questions'])} question(s)...")
         graph = build_ctc_graph_from_dialogue(conv["turns"], llm, max_chars_per_call=args.max_chars_per_call,
                                               segmenter=segmenter)
+        if embedder is not None:
+            graph.attach_embedder(embedder)
         if args.save_graphs_dir:
             graph.save(os.path.join(args.save_graphs_dir, f"{conv['sample_id']}_ctc_graph.json"))
 
@@ -246,17 +264,26 @@ def main() -> None:
         conv_f1 = sum(r["f1"] for r in conv_results) / len(conv_results) if conv_results else 0.0
         print(f"[eval] {conv['sample_id']}: done ({len(conv_results)} question(s), avg F1 {conv_f1 * 100:.2f}%)")
 
+        # Checkpoint after every conversation so a later crash (e.g. a server
+        # hiccup) never loses hours of completed work.
+        if args.output:
+            _dump_results(args.output, args, len(bootstrap_raw), len(eval_raw), all_results)
+
     print_results_table(all_results)
 
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as fh:
-            json.dump({
-                "config": vars(args),
-                "n_bootstrap_conversations": len(bootstrap_raw),
-                "n_eval_conversations": len(eval_raw),
-                "results": all_results,
-            }, fh, indent=2)
+        _dump_results(args.output, args, len(bootstrap_raw), len(eval_raw), all_results)
         print(f"\n[output] wrote full results to {args.output}")
+
+
+def _dump_results(path: str, args, n_bootstrap: int, n_eval: int, results: List[Dict[str, Any]]) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({
+            "config": vars(args),
+            "n_bootstrap_conversations": n_bootstrap,
+            "n_eval_conversations": n_eval,
+            "results": results,
+        }, fh, indent=2)
 
 
 if __name__ == "__main__":

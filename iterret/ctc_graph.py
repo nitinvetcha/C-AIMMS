@@ -52,6 +52,11 @@ class CueTagContentGraph:
         self.cue_tag_to_content: Dict[Tuple[str, str], Set[str]] = {}
         # phi_v->(c,g) : content id -> {(cue, tag)}
         self.content_to_cue_tag: Dict[str, Set[Tuple[str, str]]] = {}
+        # Optional semantic matching (attach_embedder). When absent, all matching
+        # stays lexical (token-overlap) -- so the dialogue/LoCoMo path is unchanged.
+        self._embedder = None
+        self._content_emb: Dict[str, object] = {}
+        self._cue_emb: Dict[str, object] = {}
 
     # ------------------------------------------------------------------
     # Graph construction
@@ -183,6 +188,76 @@ class CueTagContentGraph:
                 scored.append((len(cue_tokens), cue_id))
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return {cue_id for _, cue_id in scored[:max_matches]}
+
+    # ------------------------------------------------------------------
+    # Semantic matching (optional; used for document QA where the question
+    # rarely contains the answer's own words, so token-overlap cue matching
+    # fails). Activated only when an embedding backend is attached; otherwise
+    # every method here is inert and the lexical path above is used instead.
+    # ------------------------------------------------------------------
+    @property
+    def semantic_enabled(self) -> bool:
+        return self._embedder is not None
+
+    def attach_embedder(self, backend) -> None:
+        """Give the graph an EmbeddingBackend (from iterret.experience_bank).
+        Content/cue embeddings are computed lazily and cached on first use."""
+        self._embedder = backend
+
+    def _content_embedding(self, content_id: str):
+        emb = self._content_emb.get(content_id)
+        if emb is None:
+            emb = self._embedder.encode(self.contents[content_id].display_text())
+            self._content_emb[content_id] = emb
+        return emb
+
+    def _cue_embedding(self, cue_id: str):
+        emb = self._cue_emb.get(cue_id)
+        if emb is None:
+            emb = self._embedder.encode(cue_id)
+            self._cue_emb[cue_id] = emb
+        return emb
+
+    def semantic_match_cues(self, query: str, *, max_matches: int = 40,
+                             min_sim: float = 0.2) -> Set[str]:
+        """Cues whose embedding is most similar to the query (semantic, not
+        token-overlap). Returns up to ``max_matches`` above ``min_sim``."""
+        if not self._embedder or not self.cues:
+            return set()
+        q = self._embedder.encode(query)
+        scored: List[Tuple[float, str]] = []
+        for cue_id in self.cues:
+            sim = self._embedder.similarity(q, self._cue_embedding(cue_id))
+            if sim >= min_sim:
+                scored.append((sim, cue_id))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return {cue_id for _, cue_id in scored[:max_matches]}
+
+    def semantic_rank_contents(self, content_ids: Iterable[str], query: str) -> List[str]:
+        """Rank content ids by embedding similarity to the query (falls back to
+        the lexical ranker if no embedder is attached)."""
+        if not self._embedder:
+            return self.rank_contents_by_relevance(content_ids, query)
+        q = self._embedder.encode(query)
+        return sorted(content_ids,
+                      key=lambda cid: -self._embedder.similarity(q, self._content_embedding(cid)))
+
+    def semantic_fallback_contents(self, query: str, *, top_k: int,
+                                   exclude_content_ids: Iterable[str] = ()) -> List[str]:
+        """Top-``top_k`` content nodes by embedding similarity to the query,
+        ignoring the cue/tag graph entirely. This is the recall safety net for
+        when cue-gated traversal surfaces nothing."""
+        if not self._embedder:
+            return []
+        exclude = set(exclude_content_ids)
+        q = self._embedder.encode(query)
+        scored: List[Tuple[float, str]] = []
+        for cid in self.contents:
+            if cid in exclude:
+                continue
+            scored.append((self._embedder.similarity(q, self._content_embedding(cid)), cid))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [cid for _, cid in scored[:top_k]]
 
     # ------------------------------------------------------------------
     # Persistence
