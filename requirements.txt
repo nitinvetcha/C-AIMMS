@@ -1,12 +1,37 @@
-# ITERRET dependencies. Verified against Python 3.11.15 in a dedicated conda env
-# (`conda create -n iterret python=3.11 && pip install -r requirements.txt`).
+# =============================================================================
+# IterRet / IMR dependencies  (LoCoMo + LongBench + EM-LLM baseline harnesses)
+#
+# Verified env: Python 3.12 conda env ("caimms312").
+#   conda create -y -n caimms312 python=3.12 && conda activate caimms312
+#   pip install -r requirements.txt
+#
+# IMPORTANT version lessons (hard-won):
+#   * Use Python 3.12 (NOT 3.13): the CUDA-12 vLLM wheels stop at Python 3.12;
+#     3.13 only has CUDA-13 wheels, which need a CUDA-13 driver.
+#   * transformers must be >=4.51 (Qwen3 support: KeyError 'qwen3' otherwise) but
+#     <5 (vLLM 0.10.x calls Tokenizer.all_special_tokens_extended, removed in 5.x).
+#   * torch must match the node's NVIDIA driver. Let vLLM pull its own torch, or
+#     install a driver-matched build, e.g. for a CUDA 12.8 driver:
+#       pip install torch --index-url https://download.pytorch.org/whl/cu128
+# =============================================================================
 
-langgraph==1.2.5
-openai==2.43.0
-sentence-transformers>=3.0
+# ---- Core (always required to run the pipeline) -----------------------------
+langgraph==1.2.5              # closed-loop retrieve/reflect/route controller
+openai==2.43.0               # client for the OpenAI-compatible LLM endpoint (vLLM/Ollama)
+sentence-transformers>=3.0   # experience bank + semantic retrieval embeddings
+huggingface_hub>=0.23        # LongBench data download (bypasses the `datasets` script loader)
 
-# Optional: only needed for --surprise-segmentation (iterret.episode_segmenter /
-# iterret.surprise). These pull in a local HuggingFace causal LM to compute token
-# surprisal; a GPU is strongly recommended. The core pipeline runs without them.
+# ---- Surprise segmentation + local HF inference + tokenizers -----------------
+# Needed for: --surprise-segmentation (iterret.surprise / episode_segmenter),
+# --local-hf-llm (in-process answering), and the LongBench/EM-LLM tokenizers.
+# A GPU is strongly recommended. torch below is a placeholder version; install a
+# build matching your CUDA driver (see the note above) rather than a bare `torch`.
 torch>=2.1
-transformers>=4.40
+transformers>=4.55,<5
+
+# ---- Optional: serve the answering LLM with vLLM (for --use-real-llm) --------
+# Only needed if you run a local vLLM server instead of --local-hf-llm / Ollama.
+# Pin a CUDA-12 build on Python 3.12; comment out if you serve via Ollama or a
+# remote endpoint. vLLM pulls in a matching torch, so install it FIRST, then let
+# the lines above ride on top (do not force-reinstall torch after vLLM).
+# vllm==0.10.1.1
