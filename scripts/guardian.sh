@@ -8,6 +8,8 @@
 #
 #   bash scripts/guardian.sh                      # main OSAM pipeline (1540 rows)
 #   bash scripts/guardian.sh ablation             # IterRet-only ablation (1540 rows)
+#   bash scripts/guardian.sh bank-ablation        # IterRet + experience bank,
+#                                                 #   paper held-out split (1388 rows)
 #   bash scripts/guardian.sh <slurm> <out> <n>    # anything else
 #
 # Pass extra sbatch flags via GUARDIAN_SBATCH_ARGS, e.g.
@@ -34,6 +36,19 @@ case "${1:-main}" in
     SLURM_SCRIPT="${HERE}/run_ablation.slurm"
     OUTPUT_FILE="${CAIMMS_OUTPUT_DIR}/workmem_ablation_direct.jsonl"
     TARGET_ROWS="${TARGET_ROWS_DEFAULT}"
+    ;;
+  bank-ablation)
+    # 1388, NOT 1540: conversation 0 built the experience bank and is held out
+    # of evaluation (ITERRET paper Sec. 3). Leaving this at 1540 would make the
+    # guardian resubmit forever against a target the run can never reach.
+    SLURM_SCRIPT="${HERE}/run_bank_ablation.slurm"
+    OUTPUT_FILE="${CAIMMS_OUTPUT_DIR}/ablation_bank_heldout.jsonl"
+    TARGET_ROWS=1388
+    if [ ! -f "${CAIMMS_OUTPUT_DIR}/experience_bank.json" ]; then
+        echo "[guardian] no experience bank yet -- run the offline phase first:"
+        echo "[guardian]     cd ${CAIMMS_ROOT} && sbatch scripts/run_offline_bank.slurm"
+        exit 1
+    fi
     ;;
   *)
     SLURM_SCRIPT="$1"

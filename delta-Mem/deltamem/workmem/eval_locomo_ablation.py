@@ -13,9 +13,10 @@ from typing import List, Tuple, Set
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from deltamem.eval.locomo_protocol import (
     ADVERSARIAL_CATEGORY,
-    CATEGORY_DISPLAY_NAMES,
+    SCORED_CATEGORY_DISPLAY_NAMES,
     score_locomo_prediction,
 )
+from deltamem.workmem.bootstrap_split import is_bootstrap_sample, split_description
 from iterret.llm_client import OpenAICompatibleLLMClient
 from iterret.experience_bank import ExperienceBank, build_default_embedding_backend
 from iterret.memory_builder import DialogueTurn, build_ctc_graph_from_dialogue
@@ -44,6 +45,16 @@ ITERRET_MAX_ITERATIONS = 5
 _max_s = os.environ.get("ABLATION_MAX_SAMPLES") or os.environ.get("WORKMEM_MAX_SAMPLES")
 MAX_SAMPLES  = int(_max_s) if _max_s else None
 MAX_EVIDENCE_TOKENS = 2048  # cap evidence to avoid context overflow
+
+# Experience bank produced by the offline phase (build_bootstrap_bank.py).
+BANK_PATH = os.environ.get("CAIMMS_BANK_PATH", f"{_OUT_DIR}/experience_bank.json")
+# When running the WITH-BANK arm, a missing bank file must be a hard failure.
+# Without this the script silently falls back to an empty bank and produces a
+# perfectly plausible-looking run that is actually the no-bank arm again --
+# the same silent-degradation shape as the routing fail-open and the Phase-1
+# granularity fallback, and it would only be caught by noticing the scores
+# were suspiciously identical.
+REQUIRE_BANK = os.environ.get("CAIMMS_REQUIRE_BANK", "0") == "1"
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -164,6 +175,33 @@ def generate_direct(
 
 
 def main() -> None:
+    print(f"[init] split: {split_description()}", flush=True)
+
+    # Experience bank, loaded ONCE. It used to be re-loaded inside the
+    # per-conversation loop, which re-ran MiniLM over every entry 9 times to
+    # rebuild an identical object.
+    if Path(BANK_PATH).exists():
+        bank = ExperienceBank.load(BANK_PATH, build_default_embedding_backend())
+        print(
+            f"[init] experience bank: {len(bank.planning_bank)} planning + "
+            f"{len(bank.reflection_bank)} reflection entries from {BANK_PATH}",
+            flush=True,
+        )
+        if not bank.planning_bank and not bank.reflection_bank:
+            msg = f"experience bank at {BANK_PATH} exists but is EMPTY"
+            if REQUIRE_BANK:
+                raise SystemExit(f"ERROR: {msg}; this is the no-bank arm in disguise.")
+            print(f"[init] WARNING: {msg}", flush=True)
+    elif REQUIRE_BANK:
+        raise SystemExit(
+            f"ERROR: CAIMMS_REQUIRE_BANK=1 but no bank at {BANK_PATH}.\n"
+            "Run the offline phase first: python3 -m deltamem.workmem.build_bootstrap_bank"
+        )
+    else:
+        bank = ExperienceBank(build_default_embedding_backend())
+        print("[init] no experience bank found, using empty bank.", flush=True)
+    bank_used = bool(bank.planning_bank or bank.reflection_bank)
+
     # Load BASE model only — no adapter
     print(f"[init] Loading BASE model (no adapter) from {MODEL_PATH}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
@@ -195,15 +233,20 @@ def main() -> None:
     GRAPH_CACHE_DIR = Path(_OUT_DIR) / "graph_cache"
     GRAPH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Experience bank — load if exists, empty otherwise
-    BANK_PATH = os.environ.get("CAIMMS_BANK_PATH", f"{_OUT_DIR}/experience_bank.json")
-
     graph_llm    = OpenAICompatibleLLMClient(base_url=VLLM_BASE_URL, model=VLLM_MODEL_NAME)
     question_llm = OpenAICompatibleLLMClient(base_url=VLLM_BASE_URL, model=VLLM_MODEL_NAME)
 
     for sample_idx, sample in enumerate(samples):
         if MAX_SAMPLES is not None and sample_idx >= MAX_SAMPLES:
             break
+        # Conversations reserved for the offline bootstrap are NOT scored --
+        # the experience bank was distilled from trajectories over this very
+        # conversation's graph, so including it would report a number the
+        # paper's protocol does not define. No-op unless
+        # CAIMMS_BOOTSTRAP_SAMPLES is set (default 0 = score everything).
+        if is_bootstrap_sample(sample_idx):
+            print(f"[sample {sample_idx}] bootstrap conversation, held out of eval.", flush=True)
+            continue
 
         torch.cuda.empty_cache()
         gc.collect()
@@ -238,7 +281,6 @@ def main() -> None:
             continue
 
         graph = None
-        bank  = None
         # Share the main eval's graph cache. The CTC graph depends only on the
         # dialogue, not on which generation path consumes it, so rebuilding it
         # here would burn ~600 vLLM calls per conversation reproducing a graph
@@ -257,17 +299,16 @@ def main() -> None:
                 graph = build_ctc_graph_from_dialogue(turns, graph_llm)
                 graph.save(str(cache_path))
             print(f"[sample {sample_idx}] Graph ready: {len(graph.contents)} nodes.", flush=True)
-            if Path(BANK_PATH).exists():
-                bank = ExperienceBank.load(BANK_PATH, build_default_embedding_backend())
-                print(
-                    f"[sample {sample_idx}] Loaded experience bank: "
-                    f"{len(bank.planning_bank)} planning, "
-                    f"{len(bank.reflection_bank)} reflection entries",
-                    flush=True,
-                )
-            else:
-                bank = ExperienceBank(build_default_embedding_backend())
-                print(f"[sample {sample_idx}] No experience bank, using empty.", flush=True)
+            # CONFOUND FIX: eval_locomo_iterret_mock.py attaches an embedder to
+            # the graph and this script did not. Without one, graph.semantic_enabled
+            # is False, so (a) reflect_node's _fail_open_fallback returns the whole
+            # untouched candidate batch instead of the top-6 relevance-ranked, and
+            # (b) rank_contents_by_relevance drops its RRF embedding fusion and runs
+            # lexical-only. The ablation was therefore measuring a materially
+            # WEAKER retriever than the OSAM pipeline it is meant to isolate OSAM
+            # against -- two variables again, exactly like the prompt confound that
+            # build_answer_prompt was extracted to remove.
+            graph.attach_embedder(bank.backend)
         except Exception as exc:
             print(f"[sample {sample_idx}] Graph build FAILED: {exc}", flush=True)
             with open(OUTPUT_FILE, "a") as cf:
@@ -363,6 +404,7 @@ def main() -> None:
                 "category": question.get("category"),
                 "n_evidence_retrieved": n_ev,
                 "prediction": prediction, "score": score, "skipped": False,
+                "bank_used": bank_used,
             }
             with open(OUTPUT_FILE, "a") as cf:
                 cf.write(json.dumps(entry) + "\n")
@@ -376,7 +418,7 @@ def main() -> None:
 
             torch.cuda.empty_cache()
 
-        del graph, bank
+        del graph  # `bank` is hoisted out of this loop and must survive it
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -389,7 +431,8 @@ def main() -> None:
     avg_all      = sum(r["score"] for r in all_r) / len(all_r)
     avg_answered = sum(r["score"] for r in answered) / len(answered) if answered else 0.0
     print(f"\n{'='*60}", flush=True)
-    print(f"ABLATION (IterRet + direct, NO OSAM)", flush=True)
+    print(f"ABLATION (IterRet + direct, NO OSAM) | bank={'YES' if bank_used else 'no'}", flush=True)
+    print(f"split: {split_description()}", flush=True)
     print(f"F1 (all {len(all_r)} incl. skipped): {avg_all:.4f}", flush=True)
     print(f"F1 (answered only, {len(answered)}):  {avg_answered:.4f}", flush=True)
     cat_scores: dict = {}
@@ -399,7 +442,7 @@ def main() -> None:
             cat_scores.setdefault(cat, []).append(r["score"])
         except (TypeError, ValueError):
             continue
-    for cat_id, cat_name in sorted(CATEGORY_DISPLAY_NAMES.items()):
+    for cat_id, cat_name in sorted(SCORED_CATEGORY_DISPLAY_NAMES.items()):
         if cat_id in cat_scores:
             sc = cat_scores[cat_id]
             print(

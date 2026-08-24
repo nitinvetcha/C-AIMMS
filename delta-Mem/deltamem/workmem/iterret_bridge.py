@@ -46,6 +46,7 @@ def get_iterret_evidence(
     *,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     diag: dict | None = None,
+    state_out: dict | None = None,
 ) -> List[str]:
     """Run retrieve/reflect/route for up to max_iterations rounds.
     Returns deduplicated accumulated_evidence WITHOUT calling answer_node.
@@ -61,6 +62,16 @@ def get_iterret_evidence(
     actually made, why the loop stopped). Passed as an out-parameter rather
     than folded into the return value so every existing caller keeps working
     unchanged -- the return type is still just list[str].
+
+    ``state_out``: optional dict, updated IN PLACE with the final IterRetState.
+    Same out-parameter rationale as ``diag``. This exists so the OFFLINE
+    bootstrap phase (build_bootstrap_bank.py) can read ``search_trajectory``
+    -- the per-step Planning/Reflection record the rubric evaluator scores --
+    without reimplementing this loop. That matters: the bootstrap trajectories
+    must come from the SAME controller the online phase runs, including this
+    function's dedup / token-budget / graph-exhausted stopping conditions.
+    A second copy of the loop would drift from this one exactly the way the
+    two IterRet checkouts and the three CATEGORY_MAP copies already did.
     """
     state = new_state(question, max_iterations=max_iterations)
 
@@ -122,5 +133,8 @@ def get_iterret_evidence(
             # the cap was never the problem and the prompt is.
             "max_route_raw_len": max((d.get("raw_len", 0) for d in route_diagnostics), default=0),
         })
+
+    if state_out is not None:
+        state_out.update(state)
 
     return deduped

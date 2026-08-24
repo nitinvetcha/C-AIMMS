@@ -11,6 +11,7 @@ from deltamem.eval.locomo_protocol import (
     score_locomo_prediction,
 )
 from deltamem.runtime.session import DeltaMemChatSession
+from deltamem.workmem.bootstrap_split import is_bootstrap_sample, split_description
 from deltamem.workmem.iterret_bridge import get_iterret_evidence
 from deltamem.workmem.osam_workmem import (
     answer_with_osam, populate_osam_from_evidence, maybe_narrow_evidence,
@@ -97,6 +98,7 @@ def gold_answer_of(q: dict) -> str:
 
 def main() -> None:
     print(f"[init] MAX_SAMPLES={MAX_SAMPLES!r}  OUTPUT_FILE={OUTPUT_FILE!r}", flush=True)
+    print(f"[init] split: {split_description()}", flush=True)
     print(f"[init] Loading base model from {MODEL_PATH}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
     if tokenizer.pad_token_id is None:
@@ -135,6 +137,12 @@ def main() -> None:
     for sample_idx, sample in enumerate(samples):
         if MAX_SAMPLES is not None and sample_idx >= MAX_SAMPLES:
             break
+        # Held out of evaluation when a bootstrap split is configured, so this
+        # pipeline scores the SAME question set as the ablation it is compared
+        # against. No-op by default (CAIMMS_BOOTSTRAP_SAMPLES=0).
+        if is_bootstrap_sample(sample_idx):
+            print(f"[sample {sample_idx}] bootstrap conversation, held out of eval.", flush=True)
+            continue
 
         torch.cuda.empty_cache()
         gc.collect()
