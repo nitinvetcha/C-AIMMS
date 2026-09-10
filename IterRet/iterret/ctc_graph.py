@@ -109,6 +109,15 @@ class CueTagContentGraph:
         self._embedder = None
         self._content_emb: Dict[str, object] = {}
         self._cue_emb: Dict[str, object] = {}
+        self._tag_emb: Dict[str, object] = {}
+        # Single-entry memo for the query vector. rank_tags_by_relevance is
+        # called TWICE per retrieve round with the identical query (nodes.py
+        # caps to MAX_ACTIVE_TAGS, then re-ranks the active set), and each
+        # call would otherwise re-encode the same string. Bounded to one
+        # entry on purpose: a run sees thousands of distinct refined queries
+        # and an unbounded dict would grow without ever being read again.
+        self._query_emb: object = None
+        self._query_emb_key: Optional[str] = None
         # Corpus statistics for relevance scoring (IDF over content nodes).
         # Built lazily on first rank_*_by_relevance call, invalidated by
         # add_content. Derived entirely from self.contents, so load()
@@ -240,12 +249,82 @@ class CueTagContentGraph:
         return self._idf.get(token, 0.0)
 
     def rank_tags_by_relevance(self, tags: Iterable[str], query: str) -> List[str]:
+        """Tag-layer ranking, mirroring the content layer's hybrid scoring.
+
+        This is the single most load-bearing ranker in retrieval: measured
+        over all 1986 LoCoMo questions against the cached CTC graphs, the
+        cue->tag hop reaches a tag carrying the gold evidence 95.2% of the
+        time, but ``retrieve_node`` then has to cut a mean fanout of ~350
+        tags down to MAX_ACTIVE_TAGS (15) -- and 99.4% of rounds hit that
+        cap. Under lexical-only scoring only 28.2% of gold-evidence tags
+        survived the cut, and 94% of the ones lost scored EXACTLY 0.0
+        (the tag phrase shares no token with the query), i.e. they were not
+        out-ranked on merit -- they lost an alphabetical tie-break among
+        hundreds of equally-zero candidates.
+
+        Embedding similarity is the only signal available that does not
+        require a shared token, so it is fused in here the same way
+        ``rank_contents_by_relevance`` fuses it at the content layer: via
+        reciprocal rank fusion, NOT by replacing lexical scoring. Cosine
+        alone drifts toward topically-adjacent-but-wrong tags ("LGBTQ
+        Advocacy" over "LGBTQ Support Group"); RRF keeps the lexical half's
+        exact-phrase precision where it has an opinion while letting the
+        semantic half break the 0.0 ties that lexical scoring cannot.
+
+        Behaviour is unchanged (pure lexical, alphabetical tie-break) when
+        no embedder is attached or DISABLE_TAG_EMBEDDER_FUSION is set, so
+        every caller that never calls ``attach_embedder`` is unaffected.
+        """
+        tags = list(tags)
         query_tokens = _content_tokens(query)
 
         def _score(tag: str) -> float:
             return sum(self._idf_of(token) for token in (_content_tokens(tag) & query_tokens))
 
-        return sorted(tags, key=lambda tag: (-_score(tag), tag))
+        scores = {tag: _score(tag) for tag in tags}
+        lexical_order = sorted(tags, key=lambda tag: (-scores[tag], tag))
+
+        # A/B escape hatch mirroring DISABLE_CONTENT_EMBEDDER_FUSION, so this
+        # change can be measured against its own baseline on the cluster
+        # without a code edit or a second checkout.
+        if os.environ.get("DISABLE_TAG_EMBEDDER_FUSION"):
+            return lexical_order
+
+        if not self._embedder:
+            return lexical_order
+
+        # Every tag scoring exactly 0.0 shares ONE "uninformative" rank rather
+        # than the position it happened to land on. This is the difference
+        # between fusion working and fusion being actively harmful here: at
+        # the tag layer 94% of the candidates in a typical round score 0.0
+        # (measured), so their relative lexical order is not a weak ranking,
+        # it is the alphabetical tie-break -- pure noise. Feeding those
+        # positions to RRF as if they were evidence lets an alphabetically
+        # early but irrelevant tag ("Art Appreciation") out-vote the tag the
+        # semantic half ranked first, which is exactly the failure this
+        # change exists to remove. Tags WITH lexical signal keep their real
+        # positions, so exact-phrase precision is untouched.
+        uninformative_rank = len(tags)
+        lexical_rank = {
+            tag: (i if scores[tag] > 0 else uninformative_rank)
+            for i, tag in enumerate(lexical_order)
+        }
+        semantic_order = self.semantic_rank_tags(tags, query)
+        semantic_rank = {tag: i for i, tag in enumerate(semantic_order)}
+
+        rrf_k = 60  # same damping constant as the content layer, for consistency
+
+        def _fused_score(tag: str) -> float:
+            return (
+                1.0 / (rrf_k + lexical_rank[tag])
+                + 1.0 / (rrf_k + semantic_rank.get(tag, len(tags)))
+            )
+
+        # Tie-break on the tag string, as the lexical-only path did: fused
+        # scores still tie when a tag holds the same rank in both orderings,
+        # and a deterministic final key keeps the output independent of the
+        # caller's iteration order (nodes.py passes a set).
+        return sorted(tags, key=lambda tag: (-_fused_score(tag), tag))
 
     def rank_contents_by_relevance(self, content_ids: Iterable[str], query: str) -> List[str]:
         """Content-layer ranking. IDF-weighted, stopword-stripped token
@@ -345,8 +424,17 @@ class CueTagContentGraph:
 
     def attach_embedder(self, backend) -> None:
         """Give the graph an EmbeddingBackend (from iterret.experience_bank).
-        Content/cue embeddings are computed lazily and cached on first use."""
+        Content/cue/tag embeddings are computed lazily and cached on first use."""
         self._embedder = backend
+        # Vectors cached under a previous backend are not comparable to the
+        # new one's, so drop them. This is a no-op on the production path
+        # (eval_locomo_iterret_mock.py attaches exactly once, immediately
+        # after load, when every cache is still empty).
+        self._content_emb = {}
+        self._cue_emb = {}
+        self._tag_emb = {}
+        self._query_emb = None
+        self._query_emb_key = None
 
     def _content_embedding(self, content_id: str):
         emb = self._content_emb.get(content_id)
@@ -361,6 +449,22 @@ class CueTagContentGraph:
             emb = self._embedder.encode(cue_id)
             self._cue_emb[cue_id] = emb
         return emb
+
+    def _tag_embedding(self, tag: str):
+        emb = self._tag_emb.get(tag)
+        if emb is None:
+            emb = self._embedder.encode(tag)
+            self._tag_emb[tag] = emb
+        return emb
+
+    def _query_embedding(self, query: str):
+        """Encode ``query``, reusing the immediately preceding result. See the
+        _query_emb note in __init__ for why this is a single entry and not a
+        dict."""
+        if self._query_emb_key != query or self._query_emb is None:
+            self._query_emb = self._embedder.encode(query)
+            self._query_emb_key = query
+        return self._query_emb
 
     def semantic_match_cues(self, query: str, *, max_matches: int = 40,
                              min_sim: float = 0.2) -> Set[str]:
@@ -385,6 +489,30 @@ class CueTagContentGraph:
         q = self._embedder.encode(query)
         return sorted(content_ids,
                       key=lambda cid: -self._embedder.similarity(q, self._content_embedding(cid)))
+
+    def semantic_rank_tags(self, tags: Iterable[str], query: str) -> List[str]:
+        """Rank tag phrases by embedding similarity to the query (falls back to
+        the lexical ranker if no embedder is attached).
+
+        Mirrors ``semantic_rank_contents`` with two deliberate differences:
+        it embeds the tag phrase itself (tags have no ContentNode and so no
+        display_text()), and it carries an explicit alphabetical tie-break.
+        The tie-break matters here in a way it does not for content: this is
+        called with a SET of several hundred tags, ties on identical
+        similarity are common among near-duplicate tag phrases, and without
+        a deterministic second key the result would depend on set iteration
+        order -- i.e. it would inject fresh run-to-run nondeterminism into a
+        pipeline whose retrieval reproducibility is already under
+        investigation.
+        """
+        tags = list(tags)
+        if not self._embedder:
+            return self.rank_tags_by_relevance(tags, query)
+        q = self._query_embedding(query)
+        return sorted(
+            tags,
+            key=lambda tag: (-self._embedder.similarity(q, self._tag_embedding(tag)), tag),
+        )
 
     def semantic_fallback_contents(self, query: str, *, top_k: int,
                                    exclude_content_ids: Iterable[str] = ()) -> List[str]:
