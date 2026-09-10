@@ -1020,9 +1020,30 @@ class DeltaMemAttention(nn.Module):
                 )
             if attention_mask.size(-2) < seq_len or attention_mask.size(-1) < seq_len:
                 raise ValueError("attention_mask is shorter than the current sequence length")
-            query_mask = attention_mask[:, 0, -seq_len:, -seq_len:]
-            diagonal = query_mask.diagonal(dim1=-2, dim2=-1)
-            return diagonal.eq(0)
+            # This branch exists only to detect padding within a batch, via a
+            # heuristic that reads the causal mask's own diagonal (a token's
+            # self-attention entry) and treats "diagonal == 0" as "this is a
+            # real token". On an incremental forward pass against an existing
+            # KV cache, this transformers version's causal-mask construction
+            # sets that diagonal entry to the masked sentinel
+            # (torch.finfo(dtype).min) for every row, not 0 -- a token being
+            # denied attention to itself, which the heuristic then reads as
+            # "every position is padding". With batch_size==1 (the only case
+            # ever exercised here -- every DeltaMemChatSession processes one
+            # conversation at a time), there is no padding to detect in the
+            # first place, so the heuristic has nothing legitimate to do:
+            # skip it and report every position valid. batch_size>1 raises
+            # rather than silently reusing a heuristic already shown wrong,
+            # so introducing batching later fails loudly instead of quietly
+            # inheriting this bug.
+            if batch_size == 1:
+                return torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
+            raise NotImplementedError(
+                "4-D token-validity mask for batch_size>1 is not validated against this "
+                "transformers version's causal-mask convention on an incremental forward "
+                "pass -- the diagonal-based heuristic denies self-attention for every row "
+                "in that case and has not been re-derived for a real batch."
+            )
         raise ValueError(
             f"Unsupported attention_mask shape for Delta-Mem state updates: {tuple(attention_mask.shape)}"
         )
