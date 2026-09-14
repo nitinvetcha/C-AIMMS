@@ -271,9 +271,11 @@ def main() -> None:
             for dialog in conv_block.get(session_key, []):
                 speaker = dialog.get("speaker", "Unknown")
                 text    = dialog.get("text", "")
-                temporal_text = f"[{session_ts}] {speaker}: {text}"
+                # Raw text, identical to eval_locomo_iterret_mock.py (shared
+                # graph cache): memory_builder and display_text() add the
+                # speaker and timestamp themselves.
                 turns.append(DialogueTurn(
-                    speaker=speaker, text=temporal_text, time=str(session_ts)
+                    speaker=speaker, text=text, time=str(session_ts)
                 ))
 
         if not turns:

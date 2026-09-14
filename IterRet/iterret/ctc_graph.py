@@ -304,7 +304,15 @@ class CueTagContentGraph:
         # semantic half ranked first, which is exactly the failure this
         # change exists to remove. Tags WITH lexical signal keep their real
         # positions, so exact-phrase precision is untouched.
-        uninformative_rank = len(tags)
+        #
+        # The shared rank sits directly after the last positive tag rather than
+        # at the bottom (len(tags)), as in the bm2772/del-mem fork's 0.4969 run:
+        # a zero-overlap tag then gives up only one rank's worth of lexical vote
+        # against the weakest lexical match, so the semantic half decides more
+        # of the order. Consequence: a zero-overlap tag ranked 1st semantically
+        # now TIES a lexical-1st tag ranked 2nd semantically, and the tag-string
+        # tie-break below decides it.
+        uninformative_rank = sum(1 for tag in tags if scores[tag] > 0)
         lexical_rank = {
             tag: (i if scores[tag] > 0 else uninformative_rank)
             for i, tag in enumerate(lexical_order)

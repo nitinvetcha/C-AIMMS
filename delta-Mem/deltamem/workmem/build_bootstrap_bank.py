@@ -101,10 +101,10 @@ def extract_session_nums(conv_block: dict) -> List[int]:
 
 
 def build_turns(conv_block: dict) -> List[DialogueTurn]:
-    """Identical turn construction to the two eval scripts, including the
-    "[timestamp] Speaker: text" prefix. It has to be identical: the CTC graph
-    cache is SHARED with them, so a graph built here must be byte-compatible
-    with one they would have built."""
+    """Identical turn construction to the two eval scripts: raw turn text, no
+    "[timestamp] Speaker:" prefix (memory_builder and display_text() add those).
+    It has to be identical: the CTC graph cache is SHARED with them, so a graph
+    built here must be byte-compatible with one they would have built."""
     turns: List[DialogueTurn] = []
     for session_num in extract_session_nums(conv_block):
         session_ts = conv_block.get(
@@ -116,7 +116,7 @@ def build_turns(conv_block: dict) -> List[DialogueTurn]:
             turns.append(
                 DialogueTurn(
                     speaker=speaker,
-                    text=f"[{session_ts}] {speaker}: {text}",
+                    text=text,
                     time=str(session_ts),
                 )
             )

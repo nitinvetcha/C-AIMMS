@@ -77,8 +77,9 @@ def build_turns(conv_block: dict) -> list:
         session_ts = conv_block.get(f"session_{session_num}_date_time", f"Session {session_num}")
         for dialog in conv_block.get(f"session_{session_num}", []):
             speaker = dialog.get("speaker", "Unknown")
-            text = f"[{session_ts}] {speaker}: {dialog.get('text', '')}"
-            turns.append(DialogueTurn(speaker=speaker, text=text, time=str(session_ts)))
+            # Raw text, identical to the eval scripts (shared graph cache).
+            turns.append(DialogueTurn(speaker=speaker, text=dialog.get("text", ""),
+                                      time=str(session_ts)))
     return turns
 
 

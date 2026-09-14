@@ -33,6 +33,11 @@ source "${REPO}/env.sh"
 
 DELTA_MEM_ROOT="${CAIMMS_ROOT}/delta-Mem"
 OUTPUT_DIR="${CAIMMS_OUTPUT_DIR}"
+# Without this the eval's OUTPUT_FILE fallback derives from CAIMMS_ROOT (the
+# repo), so the checkpoint and graph_cache landed INSIDE the repo -- invisible
+# to guardian.sh and wiped by `rsync --delete` (HANDOFF §8 trap 6). Same line
+# run_pipeline.sh already has.
+export WORKMEM_OUTPUT_FILE="${OUTPUT_DIR}/workmem_iterret_full.jsonl"
 SERVER_LOG="${OUTPUT_DIR}/server_${SLURM_JOB_ID}.log"
 MAX_WAIT=600
 INTERVAL=10

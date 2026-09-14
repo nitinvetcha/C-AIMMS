@@ -40,7 +40,11 @@ def new_state(original_query: str, *, max_iterations: int = DEFAULT_MAX_ITERATIO
         original_query=original_query,
         current_refined_query=original_query,
         accumulated_evidence=[],
-        information_gaps=["initial: no evidence gathered yet"],
+        # Empty, not a sentinel string: the old "initial: no evidence gathered
+        # yet" only cleared if reflect_node's LLM echoed it verbatim in
+        # resolved_gaps, which it essentially never did (run 12b: 1476/1540
+        # questions ran all 5 rounds), so the "no gaps -> answer" exit was dead.
+        information_gaps=[],
         active_set={"cues": [], "tags": [], "contents": []},
         visited_content_ids=[],
         search_trajectory=[],

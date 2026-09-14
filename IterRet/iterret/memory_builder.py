@@ -134,10 +134,10 @@ def _abstract_topics(episode_summaries: List[dict], llm: LLMClient, *, max_chars
 def build_ctc_graph_from_dialogue(
     turns: List[DialogueTurn], llm: LLMClient, *, max_chars_per_call: int = DEFAULT_MAX_CHARS_PER_CALL,
 ) -> CueTagContentGraph:
-    """Run all three distillation stages and assemble the CTC graph.
+    """Run the episodic and semantic distillation stages and assemble the CTC graph.
 
-    ``max_chars_per_call`` bounds how much episode text the semantic and
-    topic stages pack into a single LLM call (see module docstring); lower
+    ``max_chars_per_call`` bounds how much episode text the semantic
+    stage packs into a single LLM call (see module docstring); lower
     it if your server's context window is smaller than ~8k tokens, raise
     it (carefully) if it's much larger and you want fewer, larger calls.
     """
@@ -162,10 +162,10 @@ def build_ctc_graph_from_dialogue(
         graph.add_content(content_id, semantic["content"], layer="semantic")
         graph.link(semantic["cue"], semantic["tag"], content_id)
 
-    # 3. Abstraction layer: topic nodes wired to their constituent episodes.
-    for k, topic in enumerate(_abstract_topics(episode_summaries, llm, max_chars=max_chars_per_call)):
-        content_id = f"t{k + 1}"
-        graph.add_content(content_id, f"Topic: {topic['topic']}", layer="topic",
-                           topic_links=topic["episode_ids"])
+    # No abstraction (topic) layer. _abstract_topics built "topic" nodes that
+    # were never .link()'d into cue->tag->content, so traversal could never
+    # reach them -- LLM calls spent on unreachable nodes. Graphs already in
+    # outputs/graph_cache/ still contain t* topic nodes; this only affects
+    # graphs built from now on.
 
     return graph

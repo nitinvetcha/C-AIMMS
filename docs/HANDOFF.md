@@ -1,6 +1,6 @@
 # C-AIMMS / WORKMEM — Handoff
 
-**Last updated:** 2026-09-10. This file replaces all prior versions (the run-by-run history that used to live here has been trimmed — only conclusions worth not re-deriving are kept, in §7).
+**Last updated:** 2026-09-15 (run-13 retrieval changes landed, run pending). This file replaces all prior versions (the run-by-run history that used to live here has been trimmed — only conclusions worth not re-deriving are kept, in §7).
 
 ---
 
@@ -49,6 +49,7 @@ delta-Mem/deltamem/
 IterRet/iterret/                VENDORED into this branch (see §9)
   ctc_graph.py, nodes.py        retrieval graph + ranking (out of scope for §5 — that's delta-mem only)
                                  rank_tags_by_relevance now fuses lexical + MiniLM-embedding RRF (§4 run 12b, §7)
+                                 retrieve_node: embedding cue seeding + thin-round semantic top-up (§4 run 13)
 scripts/validate_tag_fusion.py  offline A/B for the tag-layer fusion, no GPU/LLM needed -- see its own docstring
 ```
 
@@ -89,6 +90,18 @@ rsync -avP ashwinkm@10.24.32.171:~/C-AIMMS/outputs/workmem_iterret_full.jsonl \
   ~/Documents/C-AIMMS/outputs/workmem_runNN_$(date +%Y-%m-%d).jsonl
 ```
 
+**Full run on Mahamathi (SLURM).** `run_full_pipeline.slurm` asks for 2× A100 for 24h with `--requeue`; `guardian.sh main` resubmits until the checkpoint has 1540 rows, so early kills (§9) only cost time. From the Mac, sync with `outputs/` excluded — before the trap-6 fix, SLURM runs wrote their checkpoint and `graph_cache/` to `<repo>/outputs/`, which a plain `--delete` would erase:
+```bash
+rsync -av --delete --exclude='__pycache__' --exclude='.git' --exclude='outputs/' \
+  ~/Documents/C-AIMMS/workmem-vertical/ arnavbhatt@10.16.63.23:/home/kbasu/arnavbhatt/workmem_test/workmem-vertical/
+```
+Then on the Mahamathi login node, in **bash** (see §8 trap 7), archive the old checkpoint and start the guardian under tmux:
+```bash
+cd /home/kbasu/arnavbhatt/workmem_test/workmem-vertical && source env.sh
+mv "$CAIMMS_OUTPUT_DIR/workmem_iterret_full.jsonl" "$CAIMMS_OUTPUT_DIR/workmem_iterret_full_$(date +%Y%m%d_%H%M%S).jsonl" 2>/dev/null
+tmux new -s caimms_run13 'bash scripts/guardian.sh main'
+```
+
 **Env knobs**, all default to current pipeline behavior:
 
 | var | default | effect |
@@ -99,6 +112,10 @@ rsync -avP ashwinkm@10.24.32.171:~/C-AIMMS/outputs/workmem_iterret_full.jsonl \
 | `WORKMEM_TEMPORAL_NARROWING` | `0` | `1` restores temporal evidence narrowing (was hurting the category, §7) |
 | `OSAM_TEMPORAL_QUERY_PATTERN` | built-in regex | override the timing-question detector |
 | `VLLM_PORT` | `8000` | override if the port is taken |
+| `ITERRET_SEMANTIC_CUES` | `1` | `0` = lexical all-words cue gate, seeded once (pre-run-13 behaviour) |
+| `ITERRET_FALLBACK_TOPUP_MIN` | `8` | top-up fires when a round's cue-gated hits are fewer than this |
+| `ITERRET_FALLBACK_TOPUP_ADD` | `10` | max nodes the top-up adds per round; `0` disables it (pre-run-13 behaviour) |
+| `DISABLE_TAG_EMBEDDER_FUSION` | unset | set = pure-lexical tag ranking (pre-run-12b behaviour) |
 
 ---
 
@@ -115,6 +132,8 @@ All numbers recomputed directly from the `.jsonl` files, adversarial excluded.
 | run 11 (Aug-19 prompt/retrieval fixes) | Aug 19 | 0.3139 | 0.2422 | 0.3233 | 0.1349 | 0.3547 |
 | run 12a (mask fix alone) | Sep 7 | 0.3404 | 0.2648 | 0.3672 | 0.1668 | 0.3754 |
 | **run 12b** (mask fix + tag-layer RRF fusion) | Sep 7 | **0.4214** | **0.3614** | **0.4035** | **0.1732** | **0.4766** |
+| run 13 (12b + fork retrieval changes) | pending | — | — | — | — | — |
+| *ref: bm2772/del-mem fork, engineered prompt* | *Sep 14* | *0.4969* | *0.448* | *0.433* | *0.143* | *0.576* |
 
 **Run 11 narrative (superseded as the top result by run 12b, but the analysis below still holds for anyone reading run 11's own file).** Temporal broke its four-run losing streak decisively (+0.080 vs run 9, matched-pair: 113 improved / 41 regressed / net +25.78 on 321 questions) — driven by two prompt changes: the timing instruction moved to immediately after the question (restoring run 6's structure), and its enumerated relative-expression list ("yesterday, last week...") removed (was priming the model to emit exactly those phrases). Open-domain regressed sharply (−0.083) — root-caused to the new yes/no instruction ("start with Yes/No, then add a short phrase") combined with `score_locomo_prediction`'s pre-existing category-3 behavior of truncating gold at the first `;`, so any elaboration is precision-poison against a one-word target. Measured: 0/49 yes/no-gated questions elaborated in run 9 across all categories; 23/23 did on open-domain alone in run 11, scoring 0.145 mean F1. A second, smaller new issue: the "name a thing" instruction has no case for count questions (`"How many dogs?"` → `"Scout"`, a dog's name, not a number) — F1 on "how many" questions fell 0.190→0.122. Neither has been fixed yet.
 
@@ -124,6 +143,15 @@ All numbers recomputed directly from the `.jsonl` files, adversarial excluded.
 - **Tag-layer RRF fusion, on top of the mask fix (run 12b vs run 12a): +0.0810 absolute (+23.8% relative) — the larger of the two effects.** Fixes `IterRet/iterret/ctc_graph.py`'s `rank_tags_by_relevance`. Measured over all 1986 LoCoMo questions against the cached CTC graphs: the cue→tag hop reaches a tag carrying gold evidence 95.2% of the time (cue matching itself is NOT the retrieval bottleneck — see the corrected §6 entry), but the fanout averages ~350 tags and gets cut to `MAX_ACTIVE_TAGS` (15) in 99.4% of rounds. Under the old lexical-only scorer, only 28.2% of gold-evidence tags survived that cut, and 94% of the losses scored an exact lexical `0.0` — an alphabetical tie-break among ~350 equally-uninformative candidates, not a ranking failure on merit. The fix adds `semantic_rank_tags` (embedding cosine, mirroring the content layer's existing `semantic_rank_contents`) fused with the lexical score via reciprocal rank fusion — every zero-lexical-score tag is first collapsed to one shared "uninformative" rank before fusion, otherwise alphabetical noise gets fed into RRF as a real vote (a bug caught and fixed mid-implementation). Falls back to byte-identical old behavior with no embedder attached or `DISABLE_TAG_EMBEDDER_FUSION=1` set (verified across all 1986 questions). Confirmed genuinely active in run 12b via three diagnostics moving together vs run 12a: `fail_open_all` 45.0%→36.3%, `stop_reason: graph_exhausted` 20.6%→9.4%, zero-evidence questions 17→2. This is the first measurement against the real MiniLM embedder (`sentence-transformers/all-MiniLM-L6-v2`) — an earlier offline-only measurement using this project's dependency-free `KeywordOverlapEmbeddingBackend` fallback showed only a few points of recall improvement, undershooting the real effect by roughly an order of magnitude.
 
 Open-domain remains the clear laggard through both fixes (0.1349→0.1668→0.1732): the mask fix's relative gain here (+23.6%) is proportionally its best category, but tag fusion adds almost nothing further (+3.8%). Whatever is wrong with open-domain is not primarily an attention-correctness or retrieval-ranking problem — see §7's existing open-domain findings, none of which either fix touches.
+
+**Run 13 (code landed 2026-09-15, run pending): retrieval changes ported from the bm2772/del-mem fork** (`github.com/bm2772/del-mem`, a fork of this branch taken at the run-11 stage; its own notes are `docs/HANDOFF_DELMEM_FORK.md` there). The fork's full LoCoMo run with these changes scored **0.4969** on the engineered prompt, which is byte-identical to this pipeline's default prompt (the fork made it opt-in via `OSAM_PROMPT_ENGINEERING=1`; on the plain LoCoMo prompt it scored 0.4142). That run retrieved ~46 evidence items/q at 4.98 rounds/q; run 12b retrieved 13.9/q. Ported as a bundle — the fork never measured the changes individually, and run 13's job is to reproduce the end-to-end number on this codebase:
+1. **Cue seeding by embedding** (`nodes.py` `retrieve_node`, `ITERRET_SEMANTIC_CUES`): the top 40 cues by MiniLM cosine (≥0.2) to the refined query are unioned into the active set each round, replacing the all-query-words lexical gate. Existing cues keep their slots, so in practice this is round-1 seeding. `semantic_match_cues` existed before but had no caller. This is the most uncertain change — §6 measured the lexical gate already reaching a gold-evidence tag 95.2% of the time — and it is the likeliest driver of the evidence-volume jump.
+2. **Thin-round top-up** (`nodes.py`, `ITERRET_FALLBACK_TOPUP_MIN=8` / `_ADD=10`): fewer than 8 cue-gated hits in a round → add up to 10 nearest unseen nodes by embedding, within the 25/round cap. Logged per question as `retrieval.fallback_topup_total`. `semantic_fallback_contents` also previously had no caller. Fork conversation-0 sweep, ADD ∈ {5, 10, 15}: {0.327, 0.371, 0.367}.
+3. **Tag fusion zero-rank** (`ctc_graph.py`): zero-overlap tags now share the rank directly after the last lexical match instead of `len(tags)` — the fork's variant, giving the semantic half more say. This repo's deterministic tie-break and query-embedding memo are kept.
+4. **`information_gaps` starts empty** (`state.py`), making the "no gaps → answer" exit reachable (run 12b: 1476/1540 questions ran all 5 rounds). The fork still averaged 4.98 rounds, so little change expected.
+5. **Graph-build fixes** — raw turn text in all four turn builders (no doubled `[ts] Speaker:`) and no topic layer. Both apply only to graphs built from now on: the cached graphs keep the doubled prefix and their 13–51 `t*` topic nodes per conversation, and the top-up (2) can pull those topic nodes in.
+
+Not a controlled comparison with the fork: different machine and graph cache. When the file lands, check evidence/q rose toward ~35–46, `fallback_topup_total` is non-zero on some rows, rounds/q is still ~5, and there is no uniform `n_ev=6` / `fail_open_parse_failed` (the dead-vLLM signature).
 
 ---
 
@@ -147,12 +175,10 @@ Full writeup with code citations and the mechanism given in the session that pro
 
 ## 6. Other open issues
 
-- **`match_query_to_cues` is NOT the retrieval ceiling — measured 2026-09-07, corrects the prior entry here.** Over all 1986 LoCoMo questions against the cached CTC graphs, cue matching reaches a tag carrying gold evidence 95.2% of the time. The real ceiling is one hop later: `rank_tags_by_relevance`'s cut to `MAX_ACTIVE_TAGS` (15, out of a ~350-tag mean fanout, hit in 99.4% of rounds) — see §4 run 12b and §7 for the full measurement and the fix (tag-layer RRF fusion, now landed). `MAX_ACTIVE_TAGS` itself is still a flat, non-adaptive constant regardless of fanout size -- raising it, or splitting the cut into a cheap-then-careful two-stage filter, is unexplored.
-- **Evidence strings duplicate timestamp/speaker** — `memory_builder` prepends `Speaker:`, `display_text()` prepends `[ts]` again on top of turn text that already has both.
-- **Topic layer is dead code** — `_abstract_topics` spends LLM calls building nodes that are never `.link()`'d, so they're unreachable. Deleting the call is a pure speed win.
-- **`information_gaps` seeds with a literal sentinel string** that only clears if the LLM echoes it verbatim, likely making the early-exit route dead.
+- **`match_query_to_cues` is NOT the retrieval ceiling — measured 2026-09-07, corrects the prior entry here.** Over all 1986 LoCoMo questions against the cached CTC graphs, cue matching reaches a tag carrying gold evidence 95.2% of the time. The real ceiling is one hop later: `rank_tags_by_relevance`'s cut to `MAX_ACTIVE_TAGS` (15, out of a ~350-tag mean fanout, hit in 99.4% of rounds) — see §4 run 12b and §7 for the full measurement and the fix (tag-layer RRF fusion, now landed). `MAX_ACTIVE_TAGS` itself is still a flat, non-adaptive constant regardless of fanout size -- raising it, or splitting the cut into a cheap-then-careful two-stage filter, is unexplored. As of run 13 the lexical cue gate is bypassed by default (embedding seeding, §4); `ITERRET_SEMANTIC_CUES=0` restores it.
+- **FIXED 2026-09-15 (run 13 code), three former items:** evidence strings duplicating timestamp/speaker; the dead topic layer; `information_gaps` seeded with a sentinel string. The first two only take effect on rebuilt graphs — `outputs/graph_cache/` still has doubled prefixes and topic nodes. Rebuilding costs ~400–600 vLLM calls/conversation and re-extracts every cue and tag, which would confound any comparison with run 12b/13.
 - **`evidence_filter` silently no-ops if MiniLM is unavailable** — `KeywordOverlapEmbeddingBackend.encode` returns a dict, `_cosine` assumes float lists, `zip` + `TypeError` gets swallowed by a bare `except`. `run_pipeline.sh` preflights against this; `eval_locomo_ablation.py` and `ab_write_granularity.py` do not. Not fixed.
-- **Nothing is committed** — five+ weeks of work across two repos, uncommitted.
+- **Run-13 changes are uncommitted** (2026-09-15) — the branch itself is committed through `ad53d06`.
 
 ---
 
@@ -177,7 +203,9 @@ Full writeup with code citations and the mechanism given in the session that pro
 3. **Generation is greedy** (`do_sample=False`), not the official protocol's `temp=0.4/top_p=0.9/top_k=10`. `max_new_tokens` defaults to 2048, not the protocol's 50 (`OFFICIAL_MAX_NEW_TOKENS` imported, unused) — harmless today since answers are terse, but a footgun.
 4. **`hasattr(graph, "nodes")` is always False** — "Graph ready: N nodes" has never printed a real number. Cosmetic.
 5. **RESOLVED 2026-09-07 — `osam_contribution` used to show `0.0`/`0.0`/`0.0` on every row of every full run through run 11.** Fixed, see §5 item 3 and §4 run 12a. Kept here so anyone reading an old run's file (run 11 and earlier) knows why its `osam_contribution` field is either absent or all-zero, and doesn't mistake that for "OSAM contributes nothing" on those files specifically.
-6. **`run_full_pipeline.slurm` writes its output one directory too deep, found 2026-09-07 — not yet fixed.** The eval script's `OUTPUT_FILE` fallback derives from `CAIMMS_ROOT`, treating it as the workspace; `env.sh` actually sets `CAIMMS_ROOT` to the repo itself. `run_pipeline.sh` (the local, non-SLURM runner) already works around this correctly with an explicit `export WORKMEM_OUTPUT_FILE=...`; `run_full_pipeline.slurm` never does, so on Mahamathi the real output lands at `<repo>/outputs/workmem_iterret_full.jsonl` (inside the repo) instead of `<workspace>/outputs/workmem_iterret_full.jsonl`. Consequence: `guardian.sh`'s own row-counting checks the *workspace* path and can never see a SLURM-submitted job's real progress -- once such a job finishes or is killed, guardian will think 0/1540 is done and resubmit forever. Workaround used this session: check/score the repo-internal path directly; kill the guardian `tmux` session manually once the real file hits 1540 rather than trusting it to stop itself. Proper fix: add the same explicit `export WORKMEM_OUTPUT_FILE="${OUTPUT_DIR}/workmem_iterret_full.jsonl"` line to `run_full_pipeline.slurm` that `run_pipeline.sh` already has -- not yet applied, deliberately held off mid-run to avoid orphaning an in-flight job's checkpoint.
+6. **`run_full_pipeline.slurm` wrote its output one directory too deep, found 2026-09-07 — FIXED 2026-09-15** (the script now exports `WORKMEM_OUTPUT_FILE`; history kept below because SLURM outputs from before the fix live inside `<repo>/outputs/`). The eval script's `OUTPUT_FILE` fallback derives from `CAIMMS_ROOT`, treating it as the workspace; `env.sh` actually sets `CAIMMS_ROOT` to the repo itself. `run_pipeline.sh` (the local, non-SLURM runner) already works around this correctly with an explicit `export WORKMEM_OUTPUT_FILE=...`; `run_full_pipeline.slurm` never does, so on Mahamathi the real output lands at `<repo>/outputs/workmem_iterret_full.jsonl` (inside the repo) instead of `<workspace>/outputs/workmem_iterret_full.jsonl`. Consequence: `guardian.sh`'s own row-counting checks the *workspace* path and can never see a SLURM-submitted job's real progress -- once such a job finishes or is killed, guardian will think 0/1540 is done and resubmit forever. Workaround used this session: check/score the repo-internal path directly; kill the guardian `tmux` session manually once the real file hits 1540 rather than trusting it to stop itself. That export line has now been added. Its consequence: the eval's `graph_cache/` also moves from `<repo>/outputs/` to `<workspace>/outputs/`, so on Mahamathi copy any existing repo-internal cache across before the first post-fix run, or the graphs get rebuilt.
+7. **`env.sh` only works when sourced from bash.** It derives `CAIMMS_ROOT` from `BASH_SOURCE`, which zsh (the macOS default shell) leaves empty, so PYTHONPATH silently points nowhere and `import iterret` fails. Run `bash` first.
+8. **The dry run's `MockLLMClient` never returns new gaps**, so now that `information_gaps` starts empty every mock question stops after round 1. `dryrun_pipeline.py` still passes, but its retrieval-loop stage no longer exercises multiple rounds — don't read round counts from it.
 
 ---
 
@@ -187,6 +215,7 @@ Full writeup with code citations and the mechanism given in the session that pro
   - `docs/patches/iterret-workmem-modifications.patch` preserves the exact diff vs Pragnya's upstream `IterRet` branch (`949d4a3`), so the reconciliation task is still actionable without the standalone checkout. `episode_segmenter.py` and `tests/` are new files, not in the patch — take them from the vendored tree.
   - **Still Pragnya's vertical, still unreconciled.** Vendoring made the branch self-contained; it did not resolve ownership. The upstream `IterRet` branch is untouched.
 - **The repo is now self-sufficient — the separate `ashwinGPU` deployment bundle is gone** (2026-08-20). `env.sh` at the repo root derives every path from two roots (`CAIMMS_ROOT` = the repo, `CAIMMS_WORKSPACE` = its parent, holding `models/` and `outputs/`), so the identical tree runs on the Mac, Mahamathi and resiliente-2003 with no per-machine patching. The four `deltamem/workmem/*.py` files that used to exist in two versions (repo copy with hardcoded Mahamathi paths, bundle copy with env-var paths) are now the single env-var version. Deployment scripts (`run_pipeline.sh`, `setup_env.sh`, `download_assets.sh`, `dryrun_pipeline.py`, …) live in `scripts/`.
+- **A fork of this branch exists: `github.com/bm2772/del-mem`** (bm2772, Aug 29 – Sep 14). It branched at the run-11 stage, independently ported the run-12 fixes, and added the retrieval changes now brought in as run 13. Not brought in: its vLLM port/model guards and dead-server early abort, `WORKMEM_JUDGE` LLM-judge metric, `OSAM_DELTA_GAIN` / `OSAM_EVIDENCE_IN_PROMPT` knobs, and EM-LLM k-NN/contiguity expansion (tested negative there). It lacks this branch's bootstrap bank, replay harness and `validate_tag_fusion.py`, and its vendored copy of this HANDOFF is the Aug-19 version.
 - **Mahamathi job kills**: `cn6`/`a100` jobs get `CANCELLED by 0` (root) after 40min-1.5h. Ruled out: QOS, preemption, self-cancellation. Leading hypothesis: oversubscribed-node contention. **Admins never asked.** Largely moot while resiliente-2003 is primary.
 - **`pydantic` version untested**: `setup.md` says `2.9.2` is critical for vLLM/FastAPI; `requirements_exact.txt` pins `2.13.4`, which is what both boxes actually ran successfully. Which one actually matters has never been isolated.
 - **A second session/agent worked against the same Mahamathi checkout concurrently, observed 2026-09-07.** It ran an independent production run isolating the causal-mask fix (`workmem_iterret_mask_fixed.jsonl`, run 12a above) and, inspecting the shared local `outputs/` folder, flagged a file from a different session (this one's tag-fusion run, run 12b) as unrecognized -- it had no visibility into the other session's work. Nothing enforces isolation between concurrent sessions sharing one `workmem-vertical` checkout on a cluster; a sync from either side can silently overwrite the other's in-progress uncommitted edits (e.g. `IterRet/iterret/ctc_graph.py`, still uncommitted as of this update). Worth committing work more frequently, or coordinating explicitly, before this causes a real lost-work incident.

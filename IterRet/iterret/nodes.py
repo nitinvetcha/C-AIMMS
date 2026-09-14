@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Literal
 
 from .ctc_graph import CueTagContentGraph
@@ -14,6 +15,29 @@ MAX_ACTIVE_CUES = 40
 
 MAX_ACTIVE_TAGS = 15
 MAX_NEW_CONTENT_PER_ROUND = 25
+
+# Retrieval-recall changes ported from the bm2772/del-mem fork (2026-09-15);
+# that fork's full LoCoMo run with these in place scored 0.4969 on the same
+# engineered prompt this pipeline uses by default (run 12b: 0.4214). See
+# docs/HANDOFF.md §4.
+#
+# Cue seeding by embedding. When an embedder is attached, the cues most similar
+# to the CURRENT (refined) query are unioned into the active set every round,
+# replacing the all-query-words-present lexical gate. Existing cues keep their
+# slots, so once MAX_ACTIVE_CUES is full later rounds add nothing -- in practice
+# this is round-1 semantic seeding plus any room left under the cap.
+# ITERRET_SEMANTIC_CUES=0 restores the lexical seed-once path.
+SEMANTIC_CUE_SEEDING = os.environ.get("ITERRET_SEMANTIC_CUES", "1") != "0"
+
+# Recall top-up. When cue-gated traversal yields fewer than FALLBACK_TOPUP_MIN
+# new content nodes in a round, add up to FALLBACK_TOPUP_ADD of the closest
+# unseen nodes by embedding -- a union with the cue-gated hits, never a
+# replacement, and never past MAX_NEW_CONTENT_PER_ROUND. The fork's
+# conversation-0 sweep of ADD in {5, 10, 15} scored {0.327, 0.371, 0.367}: 5
+# starved multi-hop, 15 drowned open-domain/temporal. ITERRET_FALLBACK_TOPUP_ADD=0
+# disables the top-up entirely.
+FALLBACK_TOPUP_MIN = int(os.environ.get("ITERRET_FALLBACK_TOPUP_MIN", "8"))
+FALLBACK_TOPUP_ADD = int(os.environ.get("ITERRET_FALLBACK_TOPUP_ADD", "10"))
 
 # When the routing LLM's kept_content_ids can't be trusted (explicit "ALL",
 # a missing/unparseable field defaulting to "ALL", or ids that don't match
@@ -112,7 +136,11 @@ def retrieve_node(state: IterRetState, graph: CueTagContentGraph, bank: Experien
     active_set = state.setdefault("active_set", {"cues": [], "tags": [], "contents": []})
     visited = set(state.get("visited_content_ids", []))
 
-    if not active_set["cues"]:
+    if SEMANTIC_CUE_SEEDING and graph.semantic_enabled:
+        matched = graph.semantic_match_cues(query, max_matches=MAX_ACTIVE_CUES)
+        merged = list(dict.fromkeys(list(active_set["cues"]) + sorted(matched)))
+        active_set["cues"] = merged[:MAX_ACTIVE_CUES]
+    elif not active_set["cues"]:
         active_set["cues"] = sorted(graph.match_query_to_cues(query, max_matches=MAX_ACTIVE_CUES))
 
     # Planning experience retrieval (R2-Mem Eq. 12, c_i = q_i)
@@ -157,6 +185,19 @@ def retrieve_node(state: IterRetState, graph: CueTagContentGraph, bank: Experien
             if len(new_tags) < MAX_ACTIVE_TAGS:
                 new_tags.add(tag)
 
+    # Recall top-up (see FALLBACK_TOPUP_MIN). Excludes both already-visited
+    # nodes and this round's cue-gated hits, so it strictly adds.
+    n_topup = 0
+    if graph.semantic_enabled and len(new_contents) < FALLBACK_TOPUP_MIN:
+        need = min(FALLBACK_TOPUP_ADD, MAX_NEW_CONTENT_PER_ROUND - len(new_contents))
+        if need > 0:
+            topup = graph.semantic_fallback_contents(
+                query, top_k=need, exclude_content_ids=visited | new_contents)
+            topup_set = set(topup) - new_contents
+            n_topup = len(topup_set)
+            new_contents |= topup_set
+    state["fallback_topup_total"] = state.get("fallback_topup_total", 0) + n_topup
+
     # Order by relevance to the current query, not alphabetically: the whole point of capping
     # via rank_*_by_relevance above is to put the genuinely relevant items first, and an LLM
     # reading a long list pays the most attention to what's earliest in it -- re-sorting
@@ -175,7 +216,8 @@ def retrieve_node(state: IterRetState, graph: CueTagContentGraph, bank: Experien
         module="Planning",
         query_used=query,
         action_taken="+".join(actions) + (f" (excluded tags: {sorted(exclude_tags)})" if exclude_tags else ""),
-        found_summary=f"{len(new_contents)} new content node(s)",
+        found_summary=(f"{len(new_contents)} new content node(s)"
+                       + (f" (+{n_topup} semantic top-up)" if n_topup else "")),
         decision="retrieve",
     ))
     return state
