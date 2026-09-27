@@ -149,14 +149,16 @@ def _evidence_carries_dates(session) -> bool:
 # Overridable so the two can be A/B'd on the cluster without editing this file.
 PHASE1_WRITE_GRANULARITY = os.environ.get("OSAM_PHASE1_GRANULARITY", "message_mean")
 
-# Phase 2 prompt-prefill writes. "1"/default = current behaviour (the
-# instruction block and question are written into S at token granularity
-# before generation starts); "0" = the prefill READS S without overwriting
-# it, and only the generated tokens write.
+# Phase 2 prompt-prefill writes. "0"/default = the prefill READS S without
+# overwriting it, and only the generated tokens write -- the paper's Phase 2
+# ("incrementally from the model's own newly generated tokens"). "1" = the
+# pre-2026-09-15 behaviour: the instruction block and question are written into
+# S at token granularity before generation starts. Runs 12a/12b used "1".
 #
-# This is an UNMEASURED diagnostic arm, which is why it defaults to the
-# existing behaviour rather than to the one the mechanism argues for. What it
-# tests: Phase 1 writes ~12 mean-pooled evidence vectors into an 8x8 state,
+# Default flipped to "0" on 2026-09-15, before any valid measurement: the only
+# full run with "0" (workmem_phase2_write0_full.jsonl, Sep 1) predates the mask
+# fix, so delta-mem's reads were dead in it. What it tests: Phase 1 writes the
+# evidence into an 8x8 state,
 # then this prefill applies ~250-330 sequential token writes on top before the
 # model picks its first output token. Whether that erases Phase 1's
 # contribution has never been checked. The paired granularity A/B came back
@@ -166,7 +168,7 @@ PHASE1_WRITE_GRANULARITY = os.environ.get("OSAM_PHASE1_GRANULARITY", "message_me
 # simply small (online_gain=0.05, delta_o_ratio still unlogged). Running with
 # this set to 0 separates them: a materially different score means the prefill
 # was the dominant force; an equally null result points at the second cause.
-PHASE2_PROMPT_WRITE = os.environ.get("OSAM_PHASE2_PROMPT_WRITE", "1") != "0"
+PHASE2_PROMPT_WRITE = os.environ.get("OSAM_PHASE2_PROMPT_WRITE", "0") != "0"
 
 
 def populate_osam_from_evidence(session, evidence_list, *, reset=True,

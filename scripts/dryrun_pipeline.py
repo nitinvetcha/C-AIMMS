@@ -40,7 +40,7 @@ print("=" * 72)
 print("STAGE 1  config flags")
 print("=" * 72)
 check(PHASE1_WRITE_GRANULARITY == "message_mean", "Phase1 granularity = message_mean", PHASE1_WRITE_GRANULARITY)
-check(PHASE2_PROMPT_WRITE is True, "Phase2 prompt-write defaults to current behaviour")
+check(PHASE2_PROMPT_WRITE is False, "Phase2 prompt-write OFF by default (prefill reads S, does not write)")
 check(TEMPORAL_NARROWING_ENABLED is False, "temporal narrowing OFF by default")
 check(ADVERSARIAL_CATEGORY == 5, "shared adversarial constant")
 check(5 not in SCORED_CATEGORY_DISPLAY_NAMES, "adversarial excluded from scored categories")
@@ -180,7 +180,7 @@ for r in rows:
               "yesterday", "last week", "last month", "recently"]
     hit = [b for b in banned if b in p.lower()]
     check(not hit, f"[{kind}] no primed refusal/relative vocabulary", q_text[:38] + (f" got {hit}" if hit else ""))
-    check(sess.last_kwargs.get("prompt_write_enabled") is True,
+    check(sess.last_kwargs.get("prompt_write_enabled") is False,
           f"[{kind}] prompt_write_enabled threaded to generate_reply")
 print(f"  branch coverage: {dict(seen_kinds)}")
 check(len(seen_kinds) >= 2, "multiple prompt branches exercised")
