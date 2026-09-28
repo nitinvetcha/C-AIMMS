@@ -45,6 +45,7 @@ from deltamem.runtime.session import DeltaMemChatSession
 from deltamem.workmem.evidence_filter import filter_evidence_by_relevance
 from deltamem.workmem.iterret_bridge import get_iterret_evidence
 from deltamem.workmem.osam_workmem import (
+    check_timing_setup,
     answer_with_osam,
     maybe_narrow_evidence,
     populate_osam_from_evidence,
@@ -162,6 +163,7 @@ def main() -> None:
             graph.save(str(cache_path))
         bank = ExperienceBank(build_default_embedding_backend())
         graph.attach_embedder(bank.backend)
+        check_timing_setup(graph)
         print(f"[sample {sample_idx}] graph ready: {len(graph.contents)} nodes", flush=True)
 
         for q_idx, question in enumerate(questions):

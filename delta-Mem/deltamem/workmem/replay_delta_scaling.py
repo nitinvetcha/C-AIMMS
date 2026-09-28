@@ -156,6 +156,14 @@ def main() -> None:
 
     graph_cache_dir = Path(source_run).parent / "graph_cache"
     graphs: dict[int, CueTagContentGraph] = {}
+    # Replay must reproduce the source run's evidence text exactly, so resolve
+    # dates only if the source run did. Rows record it since 2026-09-28; older
+    # rows lack the field (raw graphs, unless the run pointed
+    # WORKMEM_GRAPH_CACHE_DIR at a migrated cache -- REPLAY_RESOLVE_DATES=1 then).
+    _forced = os.environ.get("REPLAY_RESOLVE_DATES")
+    resolve_dates = (_forced == "1") if _forced is not None else any(
+        r.get("graph_dates_resolved") for r in rows)
+    print(f"[init] resolve relative dates in replayed graphs: {resolve_dates}", flush=True)
 
     def graph_for(sample_idx: int) -> CueTagContentGraph | None:
         if sample_idx not in graphs:
@@ -164,7 +172,7 @@ def main() -> None:
                 print(f"[warn] no cached graph at {path}", flush=True)
                 graphs[sample_idx] = None
             else:
-                graphs[sample_idx] = CueTagContentGraph.load(str(path))
+                graphs[sample_idx] = CueTagContentGraph.load(str(path), resolve_dates=resolve_dates)
         return graphs[sample_idx]
 
     print(f"[init] loading backbone from {MODEL_PATH}", flush=True)

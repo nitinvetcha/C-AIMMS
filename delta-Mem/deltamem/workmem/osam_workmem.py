@@ -54,13 +54,42 @@ def _needs_temporal_grounding(query: str) -> bool:
     return bool(_TEMPORAL_QUERY_RE.search(query))
 
 
-# The timing answer instruction (see _temporal_answer_instruction). "0" drops it,
-# for use with graphs whose memories already carry resolved dates
-# (scripts/resolve_graph_dates.py): the date to answer with is then written in
-# the evidence itself and the prompt no longer needs to ask for the conversion.
+# The timing answer instruction (see _temporal_answer_instruction). OFF by
+# default since 2026-09-28: graphs now resolve relative dates in their memories
+# (iterret.ctc_graph.RESOLVE_DATES), so the date to answer with is written in the
+# evidence itself and the prompt no longer asks for the conversion. Measured on
+# the same 300 questions: temporal 0.502 (instruction, raw graph) -> 0.785 (no
+# instruction, resolved graph). OSAM_TIMING_INSTRUCTION=1 restores it.
 # Timing questions still skip the name-a-thing instruction when it is off --
 # its examples point away from a date -- so they get no type-specific line.
-TIMING_INSTRUCTION_ENABLED = os.environ.get("OSAM_TIMING_INSTRUCTION", "1") != "0"
+TIMING_INSTRUCTION_ENABLED = os.environ.get("OSAM_TIMING_INSTRUCTION", "0") == "1"
+
+
+def check_timing_setup(graph) -> None:
+    """Stop if the timing instruction is off but ``graph`` has raw relative dates.
+
+    That combination removes both sources of date help at once: Banaj's fork
+    measured temporal falling 0.433 -> 0.222 with no instruction on raw graphs.
+    It can only arise with ITERRET_RESOLVE_DATES=0.
+    """
+    if TIMING_INSTRUCTION_ENABLED or (getattr(graph, "meta", None) or {}).get("dates_resolved"):
+        return
+    raise SystemExit(
+        "Timing instruction is off (OSAM_TIMING_INSTRUCTION unset/0) but this graph's "
+        "relative dates are not resolved (ITERRET_RESOLVE_DATES=0?). Unset "
+        "ITERRET_RESOLVE_DATES, or set OSAM_TIMING_INSTRUCTION=1 to reproduce the old setup."
+    )
+
+# Prompt clean-up switch. Defaults to "0" (the prompt every run so far used)
+# until it has been measured on the same 300 questions.
+#
+# OSAM_NEUTRAL_ANSWER_POLICY: drop "Every question here has an answer" (true on
+# LoCoMo only because the adversarial category is excluded) and "a specific answer
+# you are unsure of is always better than a vague one" (advice tuned to LoCoMo's
+# scoring). Keeps the parts that generalise: use the evidence's words, infer the
+# most likely specific answer when it is only implied. Datasets whose questions
+# can be unanswerable should use allow_abstention=True instead.
+NEUTRAL_ANSWER_POLICY_ENABLED = os.environ.get("OSAM_NEUTRAL_ANSWER_POLICY", "0") == "1"
 
 
 # Detects genuine yes/no questions from the QUESTION TEXT ONLY -- same
@@ -396,7 +425,8 @@ def narrow_evidence_by_score_gap(question: str, evidence_list, encode_fn):
 def build_answer_prompt(query, system_instruction=None, *,
                         allow_abstention: bool = False,
                         evidence_carries_dates: bool = True,
-                        timing_instruction: bool | None = None) -> str:
+                        timing_instruction: bool | None = None,
+                        neutral_answer_policy: bool | None = None) -> str:
     """Build the instruction block + question, WITHOUT generating anything.
 
     Extracted from answer_with_osam so the OSAM pipeline and the no-OSAM
@@ -416,10 +446,13 @@ def build_answer_prompt(query, system_instruction=None, *,
     prefixes, so the timing instruction does not assert structure that is not
     there. Callers holding a session should pass _evidence_carries_dates(session).
 
-    ``timing_instruction``: None follows OSAM_TIMING_INSTRUCTION.
+    ``timing_instruction``, ``neutral_answer_policy``: None follows the matching
+    OSAM_* switch above.
     """
     if timing_instruction is None:
         timing_instruction = TIMING_INSTRUCTION_ENABLED
+    if neutral_answer_policy is None:
+        neutral_answer_policy = NEUTRAL_ANSWER_POLICY_ENABLED
     # These grounding instructions apply to every question regardless of type
     # (run 6's data: first-person suppression and the anti-refusal grounding
     # both helped broadly) -- previously they were only applied on the
@@ -492,6 +525,11 @@ def build_answer_prompt(query, system_instruction=None, *,
             "answer even when you are not certain -- a specific answer you are unsure of is "
             "always better than a vague one."
         )
+        if neutral_answer_policy:
+            answer_policy = (
+                "Answer from the evidence, using its exact words where possible. If the answer "
+                "is only implied, give the most likely specific answer rather than a vague one."
+            )
 
     instructions = [
         "Do not use first-person pronouns (I, me, my, we, our). Refer to people by name.",

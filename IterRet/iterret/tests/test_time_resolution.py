@@ -82,6 +82,59 @@ def test_longest_match_wins():
     assert _r("last weekend") == "last weekend (the weekend before 8 May, 2023)"
 
 
+def _legacy_graph_file(tmpdir):
+    """A cache file as written before 2026-09-28: raw text, full timestamp, no meta."""
+    import json, os
+    data = {"cues": {"Caroline": {"tag_set": ["Support"]}},
+            "contents": {"e1": {"text": "Caroline: I went to a support group yesterday.", "layer": "episodic",
+                                "time": TS, "tags": ["Support"], "topic_links": []},
+                         "s1": {"text": "Caroline values honesty.", "layer": "semantic",
+                                "time": None, "tags": ["Support"], "topic_links": []}},
+            "links": [["Caroline", "Support", "e1"], ["Caroline", "Support", "s1"]]}
+    path = os.path.join(tmpdir, "sample_0.json")
+    with open(path, "w") as fh:
+        json.dump(data, fh)
+    return path
+
+
+def test_graph_load_resolves_legacy_cache():
+    import tempfile
+    from iterret.ctc_graph import CueTagContentGraph
+    with tempfile.TemporaryDirectory() as d:
+        path = _legacy_graph_file(d)
+        g = CueTagContentGraph.load(path)
+        assert g.contents["e1"].text == "Caroline: I went to a support group yesterday (7 May, 2023)."
+        assert g.contents["e1"].time == "8 May, 2023"
+        assert g.contents["s1"].text == "Caroline values honesty."          # semantic: untouched
+        assert g.meta.get("dates_resolved") is True
+        raw = CueTagContentGraph.load(path, resolve_dates=False)             # old behaviour on request
+        assert raw.contents["e1"].text.endswith("yesterday.") and raw.contents["e1"].time == TS
+        assert not raw.meta.get("dates_resolved")
+
+
+def test_graph_save_load_does_not_double_annotate():
+    import os, tempfile
+    from iterret.ctc_graph import CueTagContentGraph
+    with tempfile.TemporaryDirectory() as d:
+        g = CueTagContentGraph.load(_legacy_graph_file(d))
+        out = os.path.join(d, "resaved.json")
+        g.save(out)
+        again = CueTagContentGraph.load(out)
+        assert again.contents["e1"].text == g.contents["e1"].text
+        assert again.meta.get("dates_resolved") is True
+
+
+def test_graph_build_resolves_dates():
+    from iterret.llm_client import MockLLMClient
+    from iterret.memory_builder import DialogueTurn, build_ctc_graph_from_dialogue
+    turns = [DialogueTurn(speaker="Caroline", text="I went to a support group yesterday.", time=TS)]
+    g = build_ctc_graph_from_dialogue(turns, MockLLMClient())
+    assert g.contents["e1"].text == "Caroline: I went to a support group yesterday (7 May, 2023)."
+    assert g.contents["e1"].time == "8 May, 2023" and g.meta.get("dates_resolved") is True
+    g_raw = build_ctc_graph_from_dialogue(turns, MockLLMClient(), resolve_dates=False)
+    assert g_raw.contents["e1"].text.endswith("yesterday.") and not g_raw.meta.get("dates_resolved")
+
+
 _ALL_TESTS = [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]
 
 

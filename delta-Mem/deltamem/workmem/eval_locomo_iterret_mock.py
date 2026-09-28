@@ -14,9 +14,10 @@ from deltamem.runtime.session import DeltaMemChatSession
 from deltamem.workmem.bootstrap_split import is_bootstrap_sample, split_description
 from deltamem.workmem.iterret_bridge import get_iterret_evidence
 from deltamem.workmem.osam_workmem import (
-    answer_with_osam, populate_osam_from_evidence, maybe_narrow_evidence,
+    answer_with_osam, populate_osam_from_evidence, maybe_narrow_evidence, check_timing_setup,
 )
 from deltamem.workmem.evidence_filter import filter_evidence_by_relevance
+from deltamem.workmem.run_config import record_start
 from iterret.llm_client import OpenAICompatibleLLMClient
 from iterret.experience_bank import ExperienceBank, build_default_embedding_backend
 from iterret.memory_builder import DialogueTurn, build_ctc_graph_from_dialogue
@@ -78,6 +79,22 @@ def extract_session_nums(conv_block: dict) -> List[int]:
     return sorted(nums)
 
 
+def repair_partial_last_line(output_file: str) -> None:
+    """Drop a half-written final row left by a cancel mid-write. Rows are
+    appended, so without this the next row lands on the same line and both
+    become unreadable -- one row silently missing from the finished file."""
+    path = Path(output_file)
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    data = path.read_bytes()
+    if data.endswith(b"\n"):
+        return
+    keep = data[: data.rfind(b"\n") + 1]
+    path.write_bytes(keep)
+    print(f"[checkpoint] dropped a half-written last row ({len(data) - len(keep)} bytes); "
+          "that question will be redone.", flush=True)
+
+
 def load_checkpoint(output_file: str) -> Tuple[Set[Tuple[int, int]], List[dict]]:
     completed: Set[Tuple[int, int]] = set()
     results: List[dict] = []
@@ -125,7 +142,11 @@ def main() -> None:
         samples = json.load(f)
     print(f"[init] {len(samples)} samples loaded.", flush=True)
 
+    repair_partial_last_line(OUTPUT_FILE)
     completed, results = load_checkpoint(OUTPUT_FILE)
+    # Prints every switch and a code fingerprint, and refuses to resume these
+    # rows under different settings or code (see run_config.py).
+    record_start(OUTPUT_FILE, resuming=bool(completed))
     if completed:
         print(f"[checkpoint] Resuming — {len(completed)} questions already done.", flush=True)
 
@@ -229,6 +250,8 @@ def main() -> None:
             # by embedding similarity instead of keeping everything untouched
             # when the routing LLM's decision can't be trusted.
             graph.attach_embedder(bank.backend)
+            check_timing_setup(graph)
+            graph_dates_resolved = bool(graph.meta.get("dates_resolved"))
         except Exception as exc:
             print(f"[sample {sample_idx}] Graph build FAILED: {exc}", flush=True)
             with open(OUTPUT_FILE, "a") as cf:
@@ -311,7 +334,7 @@ def main() -> None:
                     "gold_answer": gold_answer_of(question), "category": question.get("category"),
                     "n_evidence_retrieved": 0, "prediction": "", "score": 0.0,
                     "skipped": True, "reason": "no_relevant_evidence",
-                    "retrieval": retrieval_diag,
+                    "retrieval": retrieval_diag, "graph_dates_resolved": graph_dates_resolved,
                 }
                 with open(OUTPUT_FILE, "a") as cf:
                     cf.write(json.dumps(entry) + "\n")
@@ -359,6 +382,7 @@ def main() -> None:
                 "n_evidence_retrieved": n_ev, "prediction": prediction, "score": score, "skipped": False,
                 "retrieval": retrieval_diag,
                 "osam_contribution": osam_contribution,
+                "graph_dates_resolved": graph_dates_resolved,
             }
             with open(OUTPUT_FILE, "a") as cf:
                 cf.write(json.dumps(entry) + "\n")

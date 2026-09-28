@@ -15,7 +15,11 @@ still walks the same graph and no LLM call is needed:
 graphs built before the fork port carry inside their text. It is off by
 default so its effect can be measured separately from the date change.
 
-Point the eval at the result with WORKMEM_GRAPH_CACHE_DIR=<dst>.
+Since 2026-09-28 this is OPTIONAL: CueTagContentGraph resolves relative dates
+itself whenever a graph is built or loaded (ITERRET_RESOLVE_DATES, default on),
+giving byte-identical text to this script's default output. It remains useful to
+write resolved files to disk, and for --fix-doubled-prefix. Point the eval at a
+migrated cache with WORKMEM_GRAPH_CACHE_DIR=<dst>.
 
   source env.sh
   python3 scripts/resolve_graph_dates.py                    # graph_cache -> graph_cache_dates

@@ -22,7 +22,7 @@ from iterret.experience_bank import ExperienceBank, build_default_embedding_back
 from iterret.memory_builder import DialogueTurn, build_ctc_graph_from_dialogue
 from iterret.ctc_graph import CueTagContentGraph
 from deltamem.workmem.iterret_bridge import get_iterret_evidence
-from deltamem.workmem.osam_workmem import build_answer_prompt
+from deltamem.workmem.osam_workmem import build_answer_prompt, check_timing_setup
 
 # ── configuration ─────────────────────────────────────────────────────────────
 # Paths resolve from CAIMMS_ROOT so this file runs unchanged on the A100 SLURM
@@ -311,6 +311,7 @@ def main() -> None:
             # against -- two variables again, exactly like the prompt confound that
             # build_answer_prompt was extracted to remove.
             graph.attach_embedder(bank.backend)
+            check_timing_setup(graph)
         except Exception as exc:
             print(f"[sample {sample_idx}] Graph build FAILED: {exc}", flush=True)
             with open(OUTPUT_FILE, "a") as cf:

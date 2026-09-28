@@ -66,6 +66,17 @@ tmp = pathlib.Path("/tmp/_smoke_graph.json"); graph.save(str(tmp))
 reloaded = CueTagContentGraph.load(str(tmp))
 check(len(reloaded.contents) == len(graph.contents), "graph save/load round-trip")
 
+# Relative dates are resolved at build time and survive save/load unchanged.
+check(graph.meta.get("dates_resolved") is True, "built graph has relative dates resolved")
+_yest = [c for c in graph.contents.values() if c.layer == "episodic" and "yesterday" in c.text]
+check(bool(_yest) and all("yesterday (" in c.text for c in _yest), "'yesterday' annotated with its date",
+      _yest[0].text[:70] if _yest else "no 'yesterday' turn in sample")
+check(all(c.time == "8 May, 2023" for c in graph.contents.values()
+          if c.layer == "episodic" and "8 May" in (c.time or "")), "timestamps shortened to the date")
+check(reloaded.meta.get("dates_resolved") is True
+      and all(reloaded.contents[k].text == graph.contents[k].text for k in graph.contents),
+      "resolved text identical after save/load (no double annotation)")
+
 # Stand-in for MiniLM: deterministic hashed bag-of-words -> FIXED-LENGTH FLOAT
 # VECTOR. Using the real KeywordOverlap fallback here would be misleading --
 # it returns a dict, which evidence_filter._cosine cannot consume (see the
@@ -160,7 +171,7 @@ class FakeSession:
         self.last_prompt, self.last_kwargs = text, kw
         return {"assistant": "stub"}
 
-from deltamem.workmem.osam_workmem import answer_with_osam
+from deltamem.workmem.osam_workmem import answer_with_osam, build_answer_prompt
 seen_kinds = collections.Counter()
 for r in rows:
     q_text = r["question"]
@@ -171,9 +182,15 @@ for r in rows:
             else "YES/NO" if _is_yes_no_question(q_text) else "NAMED")
     seen_kinds[kind] += 1
     if kind == "TEMPORAL":
-        idx_q, idx_t = p.index("Question:"), p.index("This question asks about timing")
-        check(idx_t > idx_q, f"[{kind}] timing directive AFTER the question", q_text[:38])
-        check("Pomodoro" not in p, f"[{kind}] no contradictory name-a-thing block", q_text[:38])
+        # Default (timing instruction off): no timing line, no name-a-thing block,
+        # the question is the last thing the model reads.
+        check("asks about timing" not in p and p.rstrip().endswith(q_text),
+              f"[{kind}] default: no timing directive, question last", q_text[:38])
+        check("must name a thing" not in p, f"[{kind}] no contradictory name-a-thing block", q_text[:38])
+        # When turned back on, the directive still goes AFTER the question.
+        pt = build_answer_prompt(q_text, timing_instruction=True)
+        idx_q, idx_t = pt.index("Question:"), pt.index("This question asks about timing")
+        check(idx_t > idx_q, f"[{kind}] timing directive AFTER the question when on", q_text[:38])
     if kind == "NAMED":
         check("must name a thing" in p, f"[{kind}] name-a-thing instruction present", q_text[:38])
     banned = ["not specified", "cannot determine", "not mentioned", "unknown",
@@ -188,14 +205,23 @@ check(len(seen_kinds) >= 2, "multiple prompt branches exercised")
 # adaptive date claim
 undated = FakeSession(["Caroline values community support."] * 4)
 check(_evidence_carries_dates(undated) is False, "undated evidence detected")
-answer_with_osam(undated, "When did Caroline join?")
-check("Each evidence item begins with the date" not in undated.last_prompt,
+check("Each evidence item begins with the date" not in build_answer_prompt(
+          "When did Caroline join?", timing_instruction=True, evidence_carries_dates=False),
       "date claim dropped when evidence has no timestamps")
 
 # OSAM_TIMING_INSTRUCTION=0: timing questions get no timing line AND stay out of
 # the name-a-thing branch; other questions are unaffected.
-from deltamem.workmem.osam_workmem import build_answer_prompt, TIMING_INSTRUCTION_ENABLED
-check(TIMING_INSTRUCTION_ENABLED is True, "timing instruction ON by default")
+from deltamem.workmem.osam_workmem import TIMING_INSTRUCTION_ENABLED, check_timing_setup
+check(TIMING_INSTRUCTION_ENABLED is False, "timing instruction OFF by default")
+# Safety check: timing off + unresolved graph must stop; resolved graph passes.
+class _G:  # minimal stand-in carrying only .meta
+    def __init__(self, resolved): self.meta = {"dates_resolved": True} if resolved else {}
+check_timing_setup(_G(True))
+try:
+    check_timing_setup(_G(False)); _stopped = False
+except SystemExit:
+    _stopped = True
+check(_stopped, "safety check stops on timing-off + unresolved graph")
 q_when = "When did Caroline go to the LGBTQ support group?"
 on_p = build_answer_prompt(q_when, timing_instruction=True)
 off_p = build_answer_prompt(q_when, timing_instruction=False)
@@ -206,6 +232,17 @@ check(off_p.rstrip().endswith(q_when), "question is the last line when timing in
 q_what = "What did Caroline research?"
 check(build_answer_prompt(q_what, timing_instruction=False) == build_answer_prompt(q_what, timing_instruction=True),
       "non-timing prompts identical with the switch on or off")
+
+# Prompt clean-up switch: off by default; changes only the answer-policy line.
+from deltamem.workmem.osam_workmem import NEUTRAL_ANSWER_POLICY_ENABLED
+check(not NEUTRAL_ANSWER_POLICY_ENABLED, "prompt clean-up switch OFF by default")
+
+_np = build_answer_prompt(q_what, neutral_answer_policy=True)
+check("Every question here has an answer" not in _np and "always better" not in _np
+      and "Answer from the evidence" in _np, "neutral answer policy when on")
+check(build_answer_prompt(q_what, allow_abstention=True, neutral_answer_policy=True)
+      == build_answer_prompt(q_what, allow_abstention=True, neutral_answer_policy=False),
+      "neutral policy switch leaves the abstention-allowed policy alone")
 
 print()
 print("=" * 72)
