@@ -1,6 +1,6 @@
 # C-AIMMS / WORKMEM — Handoff
 
-**Last updated:** 2026-09-15 (retrieval changes ported from the bm2772/del-mem fork). This file replaces all prior versions (the run-by-run history that used to live here has been trimmed — only conclusions worth not re-deriving are kept, in §7).
+**Last updated:** 2026-09-28 (relative dates resolved in the memory; timing instruction off by default; run-config recording and resume guard). This file replaces all prior versions (the run-by-run history that used to live here has been trimmed — only conclusions worth not re-deriving are kept, in §7).
 
 ---
 
@@ -46,11 +46,16 @@ delta-Mem/deltamem/
     osam_workmem.py             populate_osam_from_evidence, answer_with_osam, all prompts
     iterret_bridge.py           wraps IterRet's loop, now carries retrieval diagnostics
     ab_write_granularity.py     paired A/B harness (granularity — result in §7)
+    run_config.py               a run's effective switches + code fingerprint; <results>.config.jsonl; resume guard (§3)
 IterRet/iterret/                VENDORED into this branch (see §9)
   ctc_graph.py, nodes.py        retrieval graph + ranking (out of scope for §5 — that's delta-mem only)
                                  rank_tags_by_relevance now fuses lexical + MiniLM-embedding RRF (§4 run 12b, §7)
                                  retrieve_node: embedding cue seeding + thin-round semantic top-up (§4, fork port)
+                                 resolve_relative_dates(): runs on every graph build AND load (§4 date resolution)
+  time_resolution.py            the date resolver ("yesterday" -> "yesterday (7 May, 2023)")
 scripts/validate_tag_fusion.py  offline A/B for the tag-layer fusion, no GPU/LLM needed -- see its own docstring
+scripts/show_config.py          hardcoding status + every switch of a run, or of a run about to start (§3)
+scripts/resolve_graph_dates.py  optional: writes resolved copies of a graph cache to disk (§4)
 ```
 
 ---
@@ -76,6 +81,14 @@ source env.sh && cd scripts && PYTHONPATH=".:$PYTHONPATH" python3 dryrun_pipelin
 ```
 
 Score: `python3 scripts/score_calculator.py "$CAIMMS_OUTPUT_DIR/workmem_iterret_full.jsonl"`
+
+**Name each run's results file** with `WORKMEM_OUTPUT_FILE=...` (`run_pipeline.sh` honours it), so runs never resume from each other's rows. `WORKMEM_MAX_QUESTIONS=300` stops cleanly after the first 300 scored questions — always the same set (conversations 0–1 plus the first 67 of conversation 2).
+
+**Resuming a cancelled run:** re-run the identical command. Finished rows are skipped, graphs already built are reused (each is saved as soon as it is built), and a half-written last row left by a cancel mid-write is dropped and redone. Every start is recorded in `<results>.config.jsonl`; a resume under different settings or different code is refused with the exact difference named (`WORKMEM_ALLOW_CONFIG_CHANGE=1` to mix deliberately). So do not sync new code in the middle of a run you intend to resume.
+
+**Which settings and code a run uses:** `python3 scripts/show_config.py` (a run started now — prefix the flags you will use) or `python3 scripts/show_config.py <results>.jsonl` (every start of an existing run). It prints the hardcoding status first, then every switch and a `code_fingerprint`: equal fingerprints on the Mac and a cluster mean the same code. The same report heads each run log (`grep -A6 '^\[config\]' run_*.log`). Runs started before 2026-09-28 have no record; read a live one's flags with `tr '\0' '\n' < /proc/<eval pid>/environ | grep -E '^(OSAM_|ITERRET_|WORKMEM_)'`.
+
+**Reproducing runs from before 2026-09-28:** `ITERRET_RESOLVE_DATES=0 OSAM_TIMING_INSTRUCTION=1`.
 
 Sync the repo to a cluster (run from the Mac; `--delete` keeps the remote honest,
 and `models/`+`outputs/` live outside the repo so they are never touched):
@@ -116,6 +129,15 @@ tmux new -s caimms_full 'bash scripts/guardian.sh main'
 | `ITERRET_FALLBACK_TOPUP_MIN` | `8` | top-up fires when a round's cue-gated hits are fewer than this |
 | `ITERRET_FALLBACK_TOPUP_ADD` | `10` | max nodes the top-up adds per round; `0` disables it (behaviour before the fork port) |
 | `DISABLE_TAG_EMBEDDER_FUSION` | unset | set = pure-lexical tag ranking (pre-run-12b behaviour) |
+| `ITERRET_RESOLVE_DATES` | `1` | resolve relative dates in episodic memories on every graph build and load (§4); `0` = raw text, as before 2026-09-28 |
+| `OSAM_TIMING_INSTRUCTION` | `0` | `1` = restore the timing instruction (LoCoMo date-format rule with example dates). Default flipped 2026-09-28. Off + unresolved graph stops the run |
+| `OSAM_NEUTRAL_ANSWER_POLICY` | `0` | `1` = replace "Every question here has an answer… always better than a vague one" with neutral wording. Not yet measured |
+| `WORKMEM_OUTPUT_FILE` | `<outputs>/workmem_iterret_full.jsonl` | results/checkpoint file (`run_pipeline.sh` honours a preset value) |
+| `WORKMEM_MAX_QUESTIONS` | all | stop after N scored questions |
+| `WORKMEM_GRAPH_CACHE_DIR` | `<results dir>/graph_cache` | read a prebuilt cache instead; must already hold every conversation's graph |
+| `WORKMEM_ALLOW_CONFIG_CHANGE` | unset | `1` = allow resuming a results file under different settings/code |
+| `REPLAY_RESOLVE_DATES` | from the source rows | force date resolution on/off in `replay_delta_scaling.py` |
+| `CAIMMS_ALLOW_USER_SITE` | unset | `env.sh` exports `PYTHONNOUSERSITE=1` (ignore `~/.local` packages, §8 trap 9) unless this is `1` |
 
 ---
 
@@ -152,6 +174,24 @@ Open-domain remains the clear laggard through both fixes (0.1349→0.1668→0.17
 
 The fork's 0.4969 is not a controlled comparison for this codebase: different machine and graph cache.
 
+**Subset and partial runs since run 12b** (resiliente-2003; the fork's retrieval changes and `OSAM_PHASE2_PROMPT_WRITE=0` in all of them; not full runs, so not in the table above):
+
+| run (results file) | questions | overall | multi-hop | temporal | open-dom | single-hop |
+|---|---|---|---|---|---|---|
+| baseline: original graph, timing instruction on (`workmem_write0_300q`, Sep 15) | first 300 | 0.4693 | 0.5256 | 0.5016 | 0.2242 | 0.4529 |
+| **resolved dates, timing instruction off** (`workmem_dates_notiming_300q`, Sep 27) | same 300 | **0.5535** | 0.5298 | **0.7847** | 0.1716 | 0.4602 |
+| same settings, cancelled full run (`workmem_dates_notiming_partial_20260928_1443`) | 1064 (conv 0–7) | 0.5327 | 0.4684 | 0.6257 | 0.1442 | 0.5669 |
+| *run 12b on those same 1064 questions* | 1064 | *0.4229* | *0.3594* | *0.3903* | *0.1312* | *0.4951* |
+
+**Relative-date resolution (2026-09-27/28).** LoCoMo stamps a whole session with one timestamp, so "I went yesterday" carries its date only implicitly, and the old timing instruction asked the 4B model to do that arithmetic at answer time. `IterRet/iterret/time_resolution.py` now does it once, in the memory: every relative expression in an episodic turn gets the date its own timestamp implies appended, original words kept — `yesterday (7 May, 2023)`, `last week (the week before 9 June, 2023)`, `last Friday (the Friday before 15 July, 2023)`, `next month (June 2023)`, `five years ago (2018)`, `on the 17th (17 August, 2023)`, `last summer (the summer of 2022)`; "on Friday"/"the 17th" resolve before or after by the sentence's tense. Timestamps are shortened to their date (`1:56 pm on 8 May, 2023` → `8 May, 2023`). Output follows the timestamp's own style, and nothing reads questions or answers, so it carries to any timestamped dataset. It runs on every graph build and every load (`CueTagContentGraph.resolve_relative_dates`, `ITERRET_RESOLVE_DATES`), so old caches are resolved in memory with their files untouched — loading the August `graph_cache/` gives the migrated `graph_cache_dates/` node for node (6452/6452). Saved graphs carry `"meta": {"dates_resolved": true}`; result rows carry `graph_dates_resolved`. With dates in the evidence, the timing instruction became unnecessary and is off by default.
+
+- **Paired, same 300 questions, only these two changes:** overall +0.084 [95% CI +0.052, +0.117], 100 better / 42 worse; temporal +0.283 [+0.219, +0.349], 65 better / 7 worse (sign test p ≈ 7e-13). Multi-hop, single-hop and open-domain intervals all span zero; retrieval aggregates were identical (37 items/q, 5 rounds).
+- **The gain follows the dates:** the exact gold answer sits in the retrieved evidence for 75/89 temporal questions vs 28/89; the 47 whose answer became copyable only through resolution went 0.571 → 0.957, the 14 still without it barely moved (0.27 → 0.35). Temporal answers containing a year: 67 → 81/89.
+- **Losses:** 5 of the 7 temporal regressions are granularity mismatches (month-level gold, model copied "the week before X"); 18/89 answers copy the whole annotation ("Yesterday (5 July, 2023)", ~0.62 F1).
+- **Partial full run vs run 12b** (+0.110 overall, +0.235 temporal) also contains the fork retrieval changes and the Phase-2 write change — the date change alone is the paired 300-question number. Temporal varies by conversation (0.83 on conv 0, 0.42 on conv 5): the exact gold is in the evidence for 74–92% of temporal questions in conversations 0–2 but 32–42% in 3, 5 and 6, which have more durations/odd phrasings and golds outside the evidence.
+- **Disclose:** "the week before X" is the literal meaning of "last week" but also LoCoMo's own gold phrasing; anchored-relative golds gained most (+0.31). The absolute-date gain (+0.23) is plain arithmetic.
+- **Pending (started 2026-09-28):** full run with every graph rebuilt from scratch (`workmem_rebuilt_dates_full.jsonl` on resiliente; old caches moved to `outputs/archive_graphs_20260928/`). Rebuilt graphs differ in four ways — dates resolved at build, no doubled `[ts] Speaker:` prefix, no topic nodes, freshly extracted cues/tags — so it is the new version end to end, not a controlled comparison.
+
 ---
 
 ## 5. Delta-Mem issues, prioritized (paper-grounded)
@@ -175,9 +215,10 @@ Full writeup with code citations and the mechanism given in the session that pro
 ## 6. Other open issues
 
 - **`match_query_to_cues` is NOT the retrieval ceiling — measured 2026-09-07, corrects the prior entry here.** Over all 1986 LoCoMo questions against the cached CTC graphs, cue matching reaches a tag carrying gold evidence 95.2% of the time. The real ceiling is one hop later: `rank_tags_by_relevance`'s cut to `MAX_ACTIVE_TAGS` (15, out of a ~350-tag mean fanout, hit in 99.4% of rounds) — see §4 run 12b and §7 for the full measurement and the fix (tag-layer RRF fusion, now landed). `MAX_ACTIVE_TAGS` itself is still a flat, non-adaptive constant regardless of fanout size -- raising it, or splitting the cut into a cheap-then-careful two-stage filter, is unexplored. Since the fork port (2026-09-15) the lexical cue gate is bypassed by default (embedding seeding, §4); `ITERRET_SEMANTIC_CUES=0` restores it.
-- **FIXED 2026-09-15 (fork port), three former items:** evidence strings duplicating timestamp/speaker; the dead topic layer; `information_gaps` seeded with a sentinel string. The first two only take effect on rebuilt graphs — `outputs/graph_cache/` still has doubled prefixes and topic nodes. Rebuilding costs ~400–600 vLLM calls/conversation and re-extracts every cue and tag, which would confound any comparison with run 12b.
+- **FIXED 2026-09-15 (fork port), three former items:** evidence strings duplicating timestamp/speaker; the dead topic layer; `information_gaps` seeded with a sentinel string. The first two only take effect on rebuilt graphs — `outputs/graph_cache/` on the Mac still has doubled prefixes and topic nodes. Rebuilding costs ~400–600 vLLM calls/conversation and re-extracts every cue and tag, which confounds any comparison with run 12b; the rebuilt-graph full run (§4, pending) is the first to use them.
 - **`evidence_filter` silently no-ops if MiniLM is unavailable** — `KeywordOverlapEmbeddingBackend.encode` returns a dict, `_cosine` assumes float lists, `zip` + `TypeError` gets swallowed by a bare `except`. `run_pipeline.sh` preflights against this; `eval_locomo_ablation.py` and `ab_write_granularity.py` do not. Not fixed.
-- **The `OSAM_PHASE2_PROMPT_WRITE` default change (2026-09-15) is uncommitted** — the fork port itself is committed as `322290f`.
+- **Answer-prompt hardcoding, reviewed 2026-09-28.** Removed by default: the timing instruction (above). Behind an untested switch: the "Every question here has an answer…" policy (`OSAM_NEUTRAL_ANSWER_POLICY`; refusals are only 5/300 answers now, so the worst-case cost is small). **Kept deliberately:** the "name a thing" examples `'Pomodoro technique'`, `'psychology'`, `'the beach'` — these are exact gold answers for 4 open-domain questions ("…live close to a beach or the mountains?" ×3, Tim's time-management technique), disclose in any write-up; and the yes/no line's "then add a short phrase" (an offline cut to bare Yes/No scored 0.294 → 0.572 on the 40 yes/no questions, not adopted). Still present: the question-type routing (timing / yes-no / "…or…" regexes — English question shapes, accuracy measured on the scored questions; the timing pattern now only keeps timing questions out of the "name a thing" line), the no-first-person line, LoCoMo's official prompt.
+- **Still tuned on LoCoMo's scored questions, outside the prompt:** `MAX_ACTIVE_TAGS` 15, `MAX_ACTIVE_CUES` 40, top-up 8/10 (the fork swept it on conversation 0), `FAIL_OPEN_FALLBACK_TOP_K` 6, the ranker choice. Defensible option: re-check these and the routing regexes on held-out conversation 0 only (`CAIMMS_BOOTSTRAP_SAMPLES=1`, 152 questions) and report conversations 1–9 (1388); old runs can be re-scored on 1–9 offline.
 
 ---
 
@@ -190,6 +231,7 @@ Full writeup with code citations and the mechanism given in the session that pro
 - **Retrieval scorer comparison** (offline, gold LoCoMo evidence): raw token overlap R@12=0.469; +stopwords+IDF → 0.624; BM25 adds nothing beyond that (default b=0.75 is *worse* than plain IDF on short turns); cosine alone is worst (R@1 0.186). 98.3% of gold turns missed at k=12 still share a content word with the query — it's a ranking problem, not a reachability one.
 - **Tag-layer cap, not cue matching, is retrieval's real ceiling (measured 2026-09-07).** 95.2% of gold evidence is reachable via the cue→tag hop; only 28.2% survived the old lexical-only `MAX_ACTIVE_TAGS` cut, and 94% of what was lost scored an exact lexical `0.0` (an alphabetical tie-break among ~350 equally-uninformative candidates, not a ranking failure on merit). Oracle ceiling with a perfect tag ranker: 93.7% content recall — ~66 points of headroom existed at this one step alone. See §4 run 12b for the fix (tag-layer RRF fusion) and its measured in-production effect.
 - **Mask-fix and tag-fusion contributions are mechanistically separable and were measured that way, not conflated.** Holding one fixed while varying the other (§4 run 11 / 12a / 12b) showed retrieval diagnostics (`fail_open_all`, `stop_reason`, zero-evidence question count) move only between 12a and 12b, not between 11 and 12a -- confirming the mask fix's score gain comes entirely from the attention/OSAM side and the tag-fusion gain entirely from retrieval, with no cross-contamination between the two arms.
+- **Resolve dates in the memory, not in the prompt (2026-09-27).** Appending the implied date to "yesterday"/"last week" at ingestion took temporal 0.502 → 0.785 on a paired 300-question test with the timing instruction removed, and the gain tracks exactly the questions whose answer became copyable. The 4B model copies dates well; it does date arithmetic badly. See §4.
 - **Capacity**: state is r×r=64 scalars per layer; ~12 evidence writes already exceed the 8 independent directions available. Not the only channel though — see §5 item 1, the evidence is also (currently, wrongly per spec) in the KV cache.
 - Open-domain is structurally hardest — the paper's own no-OSAM baseline gets 0.1894/10.77 there. Date arithmetic is unreliable at 4B regardless of prompting. At least one LoCoMo gold has a typo (`"Yesteammates..."`) that zeroes a correct answer.
 
@@ -197,7 +239,7 @@ Full writeup with code citations and the mechanism given in the session that pro
 
 ## 8. Traps
 
-1. **Full run does not clear its checkpoint** (only `--smoke` does). Archive `workmem_iterret_full.jsonl` before every full run or you'll get old scores back in 2 minutes.
+1. **Full run does not clear its checkpoint** (only `--smoke` does). Archive `workmem_iterret_full.jsonl` before every full run or you'll get old scores back in 2 minutes — or give each run its own `WORKMEM_OUTPUT_FILE`.
 2. **Keep `outputs/graph_cache/`** — unaffected by prompt/ranking changes, costs ~600 vLLM calls/conversation to rebuild.
 3. **Generation is greedy** (`do_sample=False`), not the official protocol's `temp=0.4/top_p=0.9/top_k=10`. `max_new_tokens` defaults to 2048, not the protocol's 50 (`OFFICIAL_MAX_NEW_TOKENS` imported, unused) — harmless today since answers are terse, but a footgun.
 4. **`hasattr(graph, "nodes")` is always False** — "Graph ready: N nodes" has never printed a real number. Cosmetic.
@@ -205,6 +247,9 @@ Full writeup with code citations and the mechanism given in the session that pro
 6. **`run_full_pipeline.slurm` wrote its output one directory too deep, found 2026-09-07 — FIXED 2026-09-15** (the script now exports `WORKMEM_OUTPUT_FILE`; history kept below because SLURM outputs from before the fix live inside `<repo>/outputs/`). The eval script's `OUTPUT_FILE` fallback derives from `CAIMMS_ROOT`, treating it as the workspace; `env.sh` actually sets `CAIMMS_ROOT` to the repo itself. `run_pipeline.sh` (the local, non-SLURM runner) already works around this correctly with an explicit `export WORKMEM_OUTPUT_FILE=...`; `run_full_pipeline.slurm` never does, so on Mahamathi the real output lands at `<repo>/outputs/workmem_iterret_full.jsonl` (inside the repo) instead of `<workspace>/outputs/workmem_iterret_full.jsonl`. Consequence: `guardian.sh`'s own row-counting checks the *workspace* path and can never see a SLURM-submitted job's real progress -- once such a job finishes or is killed, guardian will think 0/1540 is done and resubmit forever. Workaround used this session: check/score the repo-internal path directly; kill the guardian `tmux` session manually once the real file hits 1540 rather than trusting it to stop itself. That export line has now been added. Its consequence: the eval's `graph_cache/` also moves from `<repo>/outputs/` to `<workspace>/outputs/`, so on Mahamathi copy any existing repo-internal cache across before the first post-fix run, or the graphs get rebuilt.
 7. **`env.sh` only works when sourced from bash.** It derives `CAIMMS_ROOT` from `BASH_SOURCE`, which zsh (the macOS default shell) leaves empty, so PYTHONPATH silently points nowhere and `import iterret` fails. Run `bash` first.
 8. **The dry run's `MockLLMClient` never returns new gaps**, so now that `information_gaps` starts empty every mock question stops after round 1. `dryrun_pipeline.py` still passes, but its retrieval-loop stage no longer exercises multiple rounds — don't read round counts from it.
+9. **`~/.local` packages override the conda env (resiliente, found 2026-09-27).** The `ashwinkm` account is shared with other projects; Python reads `~/.local/lib/python3.11/site-packages` before the env, so an unrelated `pip install` there (numpy 2.4.6, 21 Sep) broke vLLM's numba and hid that the env itself was missing `markupsafe`, `jinja2` and `urllib3`. `env.sh` now exports `PYTHONNOUSERSITE=1`. If imports fail, audit the env against `requirements-cluster.txt` **with `PYTHONNOUSERSITE=1` set** (otherwise pip sees the `~/.local` copies and installs nothing) and reinstall with `pip install --no-deps`. Model-relevant libraries (torch, transformers, tokenizers, vllm, sentence-transformers) had no `~/.local` copies, so earlier results stand.
+10. **Ports 8000 and 8001 on resiliente are taken by other users.** A root-owned Docker container serves its own vLLM on 8000 and has held ~21 GB of GPU 1. Use `VLLM_PORT=8002`. If that container claims GPU 1 mid-run the eval can run out of memory — re-run the same command to resume. It is not ours to stop.
+11. **The 300-question and partial runs of 2026-09-27/28 read a migrated cache** (`WORKMEM_GRAPH_CACHE_DIR=…/graph_cache_dates`) before load-time resolution existed, so their rows lack `graph_dates_resolved`; replay them with `REPLAY_RESOLVE_DATES=1`.
 
 ---
 
