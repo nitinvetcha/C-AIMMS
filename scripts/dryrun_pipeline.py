@@ -192,6 +192,21 @@ answer_with_osam(undated, "When did Caroline join?")
 check("Each evidence item begins with the date" not in undated.last_prompt,
       "date claim dropped when evidence has no timestamps")
 
+# OSAM_TIMING_INSTRUCTION=0: timing questions get no timing line AND stay out of
+# the name-a-thing branch; other questions are unaffected.
+from deltamem.workmem.osam_workmem import build_answer_prompt, TIMING_INSTRUCTION_ENABLED
+check(TIMING_INSTRUCTION_ENABLED is True, "timing instruction ON by default")
+q_when = "When did Caroline go to the LGBTQ support group?"
+on_p = build_answer_prompt(q_when, timing_instruction=True)
+off_p = build_answer_prompt(q_when, timing_instruction=False)
+check("asks about timing" in on_p, "timing instruction present when on")
+check("asks about timing" not in off_p, "timing instruction absent when off")
+check("must name a thing" not in off_p, "timing question kept out of name-a-thing branch when off")
+check(off_p.rstrip().endswith(q_when), "question is the last line when timing instruction is off")
+q_what = "What did Caroline research?"
+check(build_answer_prompt(q_what, timing_instruction=False) == build_answer_prompt(q_what, timing_instruction=True),
+      "non-timing prompts identical with the switch on or off")
+
 print()
 print("=" * 72)
 print("STAGE 6  scoring + checkpoint round-trip")

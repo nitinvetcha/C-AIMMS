@@ -45,6 +45,15 @@ OUTPUT_FILE = os.environ.get(
     f"{_ROOT}/outputs/workmem_iterret_full.jsonl",
 )
 MAX_SAMPLES = int(os.environ["WORKMEM_MAX_SAMPLES"]) if os.environ.get("WORKMEM_MAX_SAMPLES") else None
+# Stop cleanly once this many scored (non-adversarial) rows exist in the output
+# file, resumed rows included. Questions run in (conversation, question) order,
+# so the same N always means the same question set.
+MAX_QUESTIONS = int(os.environ["WORKMEM_MAX_QUESTIONS"]) if os.environ.get("WORKMEM_MAX_QUESTIONS") else None
+# A prebuilt graph cache to read instead of <output dir>/graph_cache, e.g. one
+# produced by scripts/resolve_graph_dates.py. Every conversation's graph must
+# already be in it: building a missing one here would silently mix a freshly
+# built, unmigrated graph into a migrated cache.
+GRAPH_CACHE_DIR_OVERRIDE = os.environ.get("WORKMEM_GRAPH_CACHE_DIR")
 
 
 
@@ -128,14 +137,32 @@ def main() -> None:
     # for the sample that was in progress no longer has to be rebuilt from the
     # ~400 LLM calls in build_ctc_graph_from_dialogue on resume -- only the
     # remaining unanswered questions in it get (re)processed.
-    GRAPH_CACHE_DIR = Path(OUTPUT_FILE).parent / "graph_cache"
-    GRAPH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if GRAPH_CACHE_DIR_OVERRIDE:
+        GRAPH_CACHE_DIR = Path(GRAPH_CACHE_DIR_OVERRIDE)
+        if not GRAPH_CACHE_DIR.is_dir():
+            raise SystemExit(f"WORKMEM_GRAPH_CACHE_DIR={GRAPH_CACHE_DIR} does not exist.")
+    else:
+        GRAPH_CACHE_DIR = Path(OUTPUT_FILE).parent / "graph_cache"
+        GRAPH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"[init] graph cache: {GRAPH_CACHE_DIR}  MAX_QUESTIONS={MAX_QUESTIONS!r}", flush=True)
+
+    def _n_scored() -> int:
+        n = 0
+        for r in results:
+            try:
+                n += int(r.get("category") or 0) != ADVERSARIAL_CATEGORY
+            except (TypeError, ValueError):
+                n += 1
+        return n
 
     graph_llm    = OpenAICompatibleLLMClient(base_url=VLLM_BASE_URL, model=VLLM_MODEL_NAME)
     question_llm = OpenAICompatibleLLMClient(base_url=VLLM_BASE_URL, model=VLLM_MODEL_NAME)
 
     for sample_idx, sample in enumerate(samples):
         if MAX_SAMPLES is not None and sample_idx >= MAX_SAMPLES:
+            break
+        if MAX_QUESTIONS is not None and _n_scored() >= MAX_QUESTIONS:
+            print(f"[stop] WORKMEM_MAX_QUESTIONS={MAX_QUESTIONS} reached.", flush=True)
             break
         # Held out of evaluation when a bootstrap split is configured, so this
         # pipeline scores the SAME question set as the ablation it is compared
@@ -178,6 +205,9 @@ def main() -> None:
         bank  = None
         cache_path = GRAPH_CACHE_DIR / f"sample_{sample_idx}.json"
         try:
+            if not cache_path.exists() and GRAPH_CACHE_DIR_OVERRIDE:
+                raise SystemExit(f"{cache_path} missing from WORKMEM_GRAPH_CACHE_DIR; refusing to "
+                                 "build an unmigrated graph into it.")
             if cache_path.exists():
                 print(f"[sample {sample_idx}] Loading cached CTC graph from {cache_path}...", flush=True)
                 graph = CueTagContentGraph.load(str(cache_path))
@@ -229,6 +259,8 @@ def main() -> None:
             # — no retrieval, no generation, no entry written, no score.
             if cat_int == ADVERSARIAL_CATEGORY:
                 continue
+            if MAX_QUESTIONS is not None and _n_scored() >= MAX_QUESTIONS:
+                break
 
             evidence: List[str] = []
             # Populated in place by get_iterret_evidence. Everything in here is

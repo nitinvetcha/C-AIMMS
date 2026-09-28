@@ -54,6 +54,15 @@ def _needs_temporal_grounding(query: str) -> bool:
     return bool(_TEMPORAL_QUERY_RE.search(query))
 
 
+# The timing answer instruction (see _temporal_answer_instruction). "0" drops it,
+# for use with graphs whose memories already carry resolved dates
+# (scripts/resolve_graph_dates.py): the date to answer with is then written in
+# the evidence itself and the prompt no longer needs to ask for the conversion.
+# Timing questions still skip the name-a-thing instruction when it is off --
+# its examples point away from a date -- so they get no type-specific line.
+TIMING_INSTRUCTION_ENABLED = os.environ.get("OSAM_TIMING_INSTRUCTION", "1") != "0"
+
+
 # Detects genuine yes/no questions from the QUESTION TEXT ONLY -- same
 # no-answer-key-leakage rule as _TEMPORAL_QUERY_RE above.
 #
@@ -386,7 +395,8 @@ def narrow_evidence_by_score_gap(question: str, evidence_list, encode_fn):
 
 def build_answer_prompt(query, system_instruction=None, *,
                         allow_abstention: bool = False,
-                        evidence_carries_dates: bool = True) -> str:
+                        evidence_carries_dates: bool = True,
+                        timing_instruction: bool | None = None) -> str:
     """Build the instruction block + question, WITHOUT generating anything.
 
     Extracted from answer_with_osam so the OSAM pipeline and the no-OSAM
@@ -405,7 +415,11 @@ def build_answer_prompt(query, system_instruction=None, *,
     ``evidence_carries_dates``: whether the evidence actually has timestamp
     prefixes, so the timing instruction does not assert structure that is not
     there. Callers holding a session should pass _evidence_carries_dates(session).
+
+    ``timing_instruction``: None follows OSAM_TIMING_INSTRUCTION.
     """
+    if timing_instruction is None:
+        timing_instruction = TIMING_INSTRUCTION_ENABLED
     # These grounding instructions apply to every question regardless of type
     # (run 6's data: first-person suppression and the anti-refusal grounding
     # both helped broadly) -- previously they were only applied on the
@@ -513,9 +527,10 @@ def build_answer_prompt(query, system_instruction=None, *,
     # emitted AFTER the question instead, see trailing_instruction below.
     trailing_instruction = None
     if _needs_temporal_grounding(query):
-        trailing_instruction = _temporal_answer_instruction(
-            evidence_carries_dates=evidence_carries_dates
-        )
+        if timing_instruction:
+            trailing_instruction = _temporal_answer_instruction(
+                evidence_carries_dates=evidence_carries_dates
+            )
     elif _is_yes_no_question(query):
         instructions.append(
             "This is a yes/no question. Start with Yes or No, then add a short phrase "

@@ -35,8 +35,11 @@ if [ "${SMOKE}" = "1" ]; then
     rm -f "${WORKMEM_OUTPUT_FILE}"
     MODE="SMOKE (1 sample / 152 questions)"
 else
-    export WORKMEM_OUTPUT_FILE="${CAIMMS_OUTPUT_DIR}/workmem_iterret_full.jsonl"
+    # A caller may name its own checkpoint (e.g. one file per A/B arm, so arms
+    # never resume from each other's rows); otherwise the standard one.
+    export WORKMEM_OUTPUT_FILE="${WORKMEM_OUTPUT_FILE:-${CAIMMS_OUTPUT_DIR}/workmem_iterret_full.jsonl}"
     MODE="FULL (10 samples / 1540 questions)"
+    [ -n "${WORKMEM_MAX_QUESTIONS:-}" ] && MODE="FIRST ${WORKMEM_MAX_QUESTIONS} QUESTIONS"
 fi
 
 caimms_activate
@@ -45,6 +48,8 @@ echo "=============================================="
 echo "  C-AIMMS ${MODE}"
 echo "  run  : ${RUN_ID} on $(hostname) at $(date)"
 echo "  out  : ${WORKMEM_OUTPUT_FILE}"
+echo "  graph: ${WORKMEM_GRAPH_CACHE_DIR:-${CAIMMS_OUTPUT_DIR}/graph_cache}"
+echo "  flags: OSAM_TIMING_INSTRUCTION=${OSAM_TIMING_INSTRUCTION:-1} OSAM_PHASE2_PROMPT_WRITE=${OSAM_PHASE2_PROMPT_WRITE:-0}"
 echo "  logs : ${RUN_LOG}"
 echo "=============================================="
 
@@ -169,7 +174,7 @@ EVAL_EXIT=${PIPESTATUS[0]}
 set -e
 
 ROWS="$(wc -l < "${WORKMEM_OUTPUT_FILE}" 2>/dev/null || echo 0)"
-EXPECT=$([ "${SMOKE}" = "1" ] && echo 152 || echo 1540)
+EXPECT=$([ "${SMOKE}" = "1" ] && echo 152 || echo "${WORKMEM_MAX_QUESTIONS:-1540}")
 echo "=============================================="
 echo "  Done at $(date) | exit ${EVAL_EXIT}"
 echo "  Rows written: ${ROWS} (expect ${EXPECT})"

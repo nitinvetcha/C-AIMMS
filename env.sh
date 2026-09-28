@@ -45,6 +45,16 @@ export PYTHONPATH="${CAIMMS_ROOT}/delta-Mem:${CAIMMS_ROOT}/IterRet:${PYTHONPATH:
 # Keep HF downloads next to the weights rather than in ~/.cache.
 export HF_HOME="${HF_HOME:-${CAIMMS_WORKSPACE}/.hf}"
 
+# Ignore ~/.local/lib/pythonX.Y/site-packages. Python reads it BEFORE the conda
+# env, so any `pip install` done elsewhere on a shared account overrides the
+# pinned env without touching it -- on resiliente (2026-09-27) it shadowed
+# numpy 2.2.6 with 2.4.6 (breaking vLLM's numba) and hid that the env itself
+# was missing markupsafe/jinja2/urllib3. Python treats ANY value as "on", so the
+# opt-out is a separate variable: CAIMMS_ALLOW_USER_SITE=1 before sourcing.
+if [ "${CAIMMS_ALLOW_USER_SITE:-0}" != "1" ]; then
+    export PYTHONNOUSERSITE=1
+fi
+
 export CONDA_ENV_NAME="${CONDA_ENV_NAME:-workmem}"
 
 # Locate the conda install rather than assuming ~/miniconda3.
